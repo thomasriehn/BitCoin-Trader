@@ -23,3 +23,10 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Build metadata
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
