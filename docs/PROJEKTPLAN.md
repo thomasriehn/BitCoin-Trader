@@ -1,6 +1,6 @@
 # Projektplan: Automatisierter Bitcoin-Handel auf Proxmox
 
-Stand: 15. September 2026. Erstellt für Thomas auf Basis recherchierter und gegengeprüfter Quellen (siehe Abschnitt 13).
+Stand: 15. September 2026. Erstellt für Thomas auf Basis recherchierter und gegengeprüfter Quellen (siehe Abschnitt 13). Nachtrag vom selben Tag: Die Entscheidungen aus Abschnitt 12 sind getroffen (Bitvavo, 1.000 EUR Startkapital, statische IP, Proxmox VE 9.2.10 mit ZFS, USV vorhanden, Advisor lokal über vLLM). Die verbindliche Bauanleitung dafür steht in `docs/KOMPONENTEN.md`.
 
 Dieses Dokument ist keine Rechts- oder Steuerberatung. Lass die Punkte aus Abschnitt 2 und 3 vor dem Live-Betrieb von einem Steuerberater mit Krypto-Erfahrung prüfen.
 
@@ -12,7 +12,7 @@ Wo eine Angabe nicht gegen eine Primärquelle geprüft werden konnte, steht "nic
 - **Wo Konto eröffnen?** Empfehlung: Bitvavo B.V. (MiCA-Lizenz der AFM, betreut deutsche Kunden direkt seit 01.09.2025, 0,15 % Maker / 0,25 % Taker, SEPA kostenlos, REST + WebSocket, ccxt-Unterstützung). Zweitkonto optional bei Kraken Pro als Fallback. Prüfenswert: OKX Europe (0,08 % / 0,10 %, MiCA-lizenziert), Bot-Tauglichkeit dort aber nicht recherchiert. Einschränkung: Freqtrade kann bei Bitvavo keinen Stop auf der Börse hinterlegen (Abschnitt 8.1, 10).
 - **Kann Claude handeln?** Nein, nicht so, wie man es sich vorstellt. Ein Sprachmodell beobachtet den Markt nicht sekündlich, ist nicht deterministisch und hat in realen Tests Geld verloren (Alpha Arena 2025: 4 von 6 Modellen mit 31 bis 63 % Verlust in zwei Wochen). Claude hilft bei Strategie, Code, Backtest-Analyse und Review. Orders setzt ein deterministischer Bot mit harten Risikogrenzen.
 - **Wie setzen wir es um?** Backtest (Abschnitt 6.5, 7) -> Dry-Run mindestens 3 Monate (Abschnitt 8, 11) -> optional Advisor im Schattenmodus (Abschnitt 5.3) -> Live mit 200 bis 500 EUR -> Skalieren nur nach Go-Kriterium (Abschnitt 11). Jede Stufe hat ein messbares Abbruchkriterium.
-- **Was brauche ich?** Ein Bitvavo-Konto mit Trade-only-API-Key, einen unprivilegierten Debian-13-LXC (2 vCPU, 4 GB RAM), Freqtrade als Bot-Framework, Tailscale für den Zugriff, Telegram und einen Dead-Man's-Switch für Alarme, eine kleine USV für den Proxmox-Host, ein steuerfähiges Handelsprotokoll, einen Anthropic-API-Key (nur wenn der Advisor gebaut wird) und einen claude.ai-Plan mit Claude Code (für Reviews und Routinen).
+- **Was brauche ich?** Ein Bitvavo-Konto mit Trade-only-API-Key, einen unprivilegierten Debian-13-LXC (2 vCPU, 4 GB RAM), Freqtrade als Bot-Framework, Tailscale für den Zugriff, Telegram und einen Dead-Man's-Switch für Alarme, eine kleine USV für den Proxmox-Host, ein steuerfähiges Handelsprotokoll, einen lokalen vLLM-Server mit GPU für den optionalen Advisor (Schattenmodus zuerst) und Claude Code für Reviews. Kein Cloud-LLM im Live-Pfad.
 - **Gebühren sind das zentrale Problem.** Ein Round-Trip kostet bei Bitvavo 0,30 % (Maker) bis 0,50 % (Taker). Die typische Kursbewegung einer 15-Minuten-Kerze liegt bei etwa 0,11 %, einer Stundenkerze bei etwa 0,28 %. Unterhalb von 4-Stunden- bis Tageskerzen ist kurzfristiger Handel mit Retail-Gebühren strukturell verlustbringend.
 - **Ehrliche Erwartung:** Ein gut gebauter, gebührenbewusster, langsamer Long-only-Bot liefert eher "Buy-and-Hold-ähnliche Rendite mit geringerem Drawdown" als eine Outperformance. Die Wahrscheinlichkeit, Buy-and-Hold über mehrere Jahre zu schlagen, liegt unter 50 %. Kapitalmaximierung durch häufiges Handeln ist nicht belegt.
 - **Steuern:** Jeder Verkauf innerhalb eines Jahres ist ein privates Veräußerungsgeschäft (§ 23 EStG), besteuert zum persönlichen Satz, Freigrenze 1.000 EUR pro Jahr (kein Freibetrag). Für das Kalenderjahr 2026 melden alle EU-Börsen erstmals deine aggregierten Umsätze und Transaktionszahlen an das BZSt (KStTG / DAC8). Buy-and-Hold hat durch die Einjahresfrist einen großen Nach-Steuer-Vorteil.
@@ -274,14 +274,14 @@ Die Whitelist setzt eine stabile öffentliche IP voraus. Deutsche Privatanschlü
 | Strategie entwerfen und als Code umsetzen | Claude (Claude Code auf dem Git-Repo) | offline, vor Backtest |
 | Backtests, Lookahead-Analyse, Hyperopt-Ergebnisse interpretieren, Overfitting erkennen | Claude | offline, nach jedem Lauf |
 | Code-Review, Log-Analyse, Anomalie-Erklärung, Wochenbericht | Claude | wöchentlich, per Claude Code oder Routine auf Git-Repo |
-| Optional: Regime-Einschätzung als strukturiertes JSON | Claude Advisor-Service | alle 1 bis 4 Stunden, nur als Gate, erst nach Schattenmodus |
+| Optional: Regime-Einschätzung als strukturiertes JSON | Advisor-Service mit lokalem vLLM-Modell (`btctrader-advisor`) | stündlich, nur als Gate, erst nach Schattenmodus |
 | Nie | Claude | Orders platzieren, Stops setzen, Exits übersteuern |
 
 Kerzenschluss und Zeitzone: Freqtrade rechnet Kerzen in UTC. Eine Tageskerze schließt um 00:00 UTC (02:00 MESZ, 01:00 MEZ), eine 4h-Kerze um 00:00, 04:00, 08:00 UTC usw. Alle Entscheidungen, Logs und Zeitstempel im Ledger werden in UTC geführt; das hält Backtest, Dry-Run und Live vergleichbar und passt zu den Börsen-Zeitstempeln nach BMF Rn. 55.
 
 ### 5.3 Optionaler Advisor: Design
 
-Ein systemd-Timer ruft alle 1 bis 4 Stunden ein Skript auf, das Claude (Sonnet 5 für Kosten, Opus 5 für Qualität; Modell-ID `claude-sonnet-5` bzw. `claude-opus-5`) mit einem kompakten Marktkontext aufruft (letzte N Kerzen, Indikatoren, Portfolio-Stand, ggf. Schlagzeilen) und eine schemavalidierte Antwort verlangt:
+Entscheidung vom 15.09.2026: Der Advisor läuft lokal gegen einen vLLM-Server (OpenAI-kompatible API) auf einem eigenen GPU-Host im Heimnetz, nicht gegen eine Cloud-API. Ein systemd-Timer ruft stündlich `btctrader-advisor run` auf. Das Skript baut einen kompakten Marktkontext nur aus öffentlichen Bitvavo-Daten (letzte 30 Tageskerzen, 24 4h-Kerzen, SMA50/200-Abstand, realisierte Volatilität, Returns, Drawdown; optional Bot-Status), schickt ihn an das lokale Modell und verlangt eine schemavalidierte Antwort:
 
 ```json
 {"regime": "risk_on | neutral | risk_off", "confidence": 0.0, "rationale": "..."}
@@ -292,10 +292,11 @@ Regeln:
 - Jede Antwort mit Prompt-Hash, Modell, Antwort, Token-Verbrauch in `decisions.jsonl` loggen.
 - Ergebnis atomar nach `decision.json` schreiben; die Freqtrade-Strategie liest die Datei in `bot_loop_start` (Mikrosekunden) und nutzt sie nur als Entry-Gate oder Positionsgrößen-Modifikator.
 - Kein Netzwerkaufruf in `confirm_trade_entry` / `confirm_trade_exit`; nie einen Stoploss-Exit ablehnen (Freqtrade-Doku: "can cause significant losses").
-- Stable System-Prompt zuerst, volatile Daten danach, damit Prompt-Caching greift (Cache-Reads 0,1x Input-Preis).
+- Stabiler System-Prompt zuerst, volatile Daten danach (vLLM Prefix-Caching); `temperature 0`, fester `seed`; vLLM Structured Outputs (`response_format` mit JSON-Schema) erzwingen das Format.
+- Modellwahl nach VRAM des GPU-Hosts, siehe `docs/VLLM_ADVISOR.md`. Der Advisor hat keine Börsen-Keys und ruft nie Order-Endpunkte auf.
 - Erst mindestens 6 Monate Schattenmodus (Entscheidungen geloggt, nicht konsumiert) auf Daten nach dem Trainings-Cutoff, dann Vergleich gated vs. ungated im Dry-Run.
 
-Voraussetzungen: ein Anthropic-API-Key (Pay-as-you-go) für `advisor.py`; für Claude Code Routines ein claude.ai-Plan Pro, Max, Team oder Enterprise (Routines sind Research Preview mit Tageslimit). Beides steht als Entscheidung in Abschnitt 12.
+Voraussetzungen: ein GPU-Host im Heimnetz mit vLLM (Docker-Compose in `deploy/vllm/`), vom Container über das LAN erreichbar; laufende Kosten sind Strom statt API-Gebühren. Claude Code wird nur für Reviews des Repos genutzt; ob dafür Routines oder manuelle Sitzungen zum Einsatz kommen, ist eine reine Komfortfrage (Abschnitt 12).
 
 Claude Code Routines eignen sich nicht als Live-Schleife: Sie laufen in der Anthropic-Cloud, mindestens stündlich, ohne Zugriff auf dein LAN. Sie eignen sich für den wöchentlichen Review: Routine zieht Backtest-Ergebnisse und Decision-Logs aus dem Git-Repo, prüft den Strategiecode und öffnet einen PR mit Vorschlägen, den du freigibst.
 
@@ -443,8 +444,8 @@ Freqtrade-Hinweise: Der Konfigurationswert `fee` wird nur in Dry-Run/Backtest be
 |  |    Telegram-Bot (/status /profit /stopentry)                  |  |
 |  |    REST-API + FreqUI auf 127.0.0.1:8080                       |  |
 |  |                                                               |  |
-|  |  claude-advisor.timer (1-4 h, optional)                       |  |
-|  |    advisor.py --> Claude API --> decisions.jsonl, decision.json|  |
+|  |  btctrader-advisor.timer (stündlich, optional)                |  |
+|  |    advisor --> vLLM (LAN, GPU-Host) --> decisions.jsonl, decision.json |  |
 |  |                                                               |  |
 |  |  ledger.timer (taeglich)                                      |  |
 |  |    Fills von Boerse (GET /v2/trades) --> fills, lots,         |  |
@@ -487,9 +488,10 @@ Freqtrade-Hinweise: Der Konfigurationswert `fee` wird nur in Dry-Run/Backtest be
   ledger.py, equity_daily.csv, fifo_lots.sqlite, exports/YYYY-MM-bitvavo-trades.csv (+ .sha256)
 /srv/trading/guard/
   guard.py                      Equity-Check, Kill-Switch, Bilanzabgleich, cancelOrdersAfter
-/etc/freqtrade/secrets.env      0600, FREQTRADE__EXCHANGE__KEY/SECRET, ANTHROPIC_API_KEY
+/etc/freqtrade/secrets.env      0640, FREQTRADE__EXCHANGE__KEY/SECRET (Trade-Key, erst Phase 4)
+/etc/freqtrade/btctrader.env    0640, Konfiguration der eigenen Dienste inkl. ADVISOR_BASE_URL (vLLM), RO-Key (siehe docs/KOMPONENTEN.md)
 /etc/freqtrade/secrets-dryrun.env  0600, View-only-Key für den Dry-Run
-/etc/systemd/system/            freqtrade.service, claude-advisor.{service,timer}, ledger.{service,timer}, guard.{service,timer}, heartbeat.{service,timer}
+/etc/systemd/system/            freqtrade-dryrun.service, freqtrade.service, btctrader-advisor.{service,timer}, btctrader-ledger.{service,timer}, btctrader-guard.{service,timer}, btctrader-heartbeat.{service,timer}, btctrader-dashboard.service
 ```
 
 ### 7.4 Datenmodell des Handelsprotokolls
@@ -549,9 +551,9 @@ Docker im LXC wird von Proxmox nicht unterstützt (Staff-Aussage 12.11.2025; run
 | 3 Tailscale | `pct set 210 --dev0 /dev/net/tun` (oder GUI Device Passthrough), im CT `tailscale up`. Voraussetzungen für `tailscale serve 8080`: in der Tailscale-Admin-Konsole MagicDNS aktivieren und unter "HTTPS Certificates" HTTPS einschalten. Ergebnis-URL: `https://btc-bot.<tailnet>.ts.net`. Achtung: Der Maschinenname landet im öffentlichen Certificate-Transparency-Log (Tailscale-Doku: "Do not enable the HTTPS feature if any of your machine names contain sensitive information"); also einen unverfänglichen Hostnamen wählen. Kein Funnel, kein Port-Forward am Router |
 | 4 Freqtrade | Nutzer `freqtrade` anlegen (`useradd -r -m -d /srv/trading -s /usr/sbin/nologin freqtrade`), `git clone` nach `/opt/freqtrade` (Owner freqtrade), `./setup.sh -i` als dieser Nutzer (legt `/opt/freqtrade/.venv` an), dann `/opt/freqtrade/.venv/bin/freqtrade create-userdir --userdir /srv/trading/user_data` und `... new-config --config /srv/trading/user_data/config.json` |
 | 5 systemd | Vollständige Unit siehe unten (System-Service, kein User-Service; Vorlage ist Freqtrades `freqtrade.service.watchdog`). sd_notify funktioniert nicht in Docker, hier schon |
-| 6 Secrets | `FREQTRADE__EXCHANGE__KEY` / `__SECRET` und `ANTHROPIC_API_KEY` nur in `/etc/freqtrade/secrets.env` (0600, Owner freqtrade) oder `config-private.json`; nie im Repo; `secrets-dryrun.env` mit View-only-Key für den Dry-Run, `secrets.env` mit Trade-Key erst ab Phase 4 |
+| 6 Secrets | `FREQTRADE__EXCHANGE__KEY` / `__SECRET` nur in `/etc/freqtrade/secrets.env` (0640, root:freqtrade) oder `config-private.json`; die eigenen Dienste lesen `/etc/freqtrade/btctrader.env` (RO-Key, vLLM-Adresse, Telegram); nie im Repo; `secrets-dryrun.env` mit View-only-Key für den Dry-Run, `secrets.env` mit Trade-Key erst ab Phase 4 |
 | 7 API/FreqUI | `listen_ip_address` 127.0.0.1 oder Tailscale-IP, `jwt_secret_key` >= 32 Zufallszeichen, starkes Passwort, `ws_token`. FreqUI hat kein HTTPS, daher nur über Tailscale |
-| 8 Firewall | Default-Deny mit dokumentierter Allowlist. Eingehend: nur Tailnet (100.64.0.0/10) und LAN-Admin-Subnetz. Ausgehend erlaubt: DNS (53 UDP/TCP zum Resolver); 443 TCP zu `api.bitvavo.com`, `ws.bitvavo.com`, `api.anthropic.com`, `api.telegram.org`, `hc-ping.com` (oder eigener Healthchecks-Host), `api.coingecko.com` (nur wenn `fiat_display_currency` gesetzt bleibt; Freqtrade nutzt CoinGecko für die EUR-Umrechnung); 80/443 zu `deb.debian.org`, `security.debian.org`, `pypi.org`, `files.pythonhosted.org`, `github.com` (Schritte 4 und 11); Tailscale: UDP 41641 ausgehend, UDP 3478 (STUN), TCP 443 zu `login.tailscale.com`, `controlplane.tailscale.com`, `log.tailscale.com` und den DERP-Relays `derp*.tailscale.com`. Die Proxmox-Firewall filtert nach IP; Bitvavo und andere stehen hinter Cloudflare mit wechselnden IPs. Praktikabel ist deshalb: ausgehend nur die genannten Ports freigeben und die Hostliste als Dokumentation führen, oder IP-Sets per Skript aus DNS aktualisieren |
+| 8 Firewall | Default-Deny mit dokumentierter Allowlist. Eingehend: nur Tailnet (100.64.0.0/10) und LAN-Admin-Subnetz. Ausgehend erlaubt: DNS (53 UDP/TCP zum Resolver); 443 TCP zu `api.bitvavo.com`, `ws.bitvavo.com`, `api.telegram.org`, `hc-ping.com` (oder eigener Healthchecks-Host), `api.coingecko.com` (nur wenn `fiat_display_currency` gesetzt bleibt; Freqtrade nutzt CoinGecko für die EUR-Umrechnung); 80/443 zu `deb.debian.org`, `security.debian.org`, `pypi.org`, `files.pythonhosted.org`, `github.com` (Schritte 4 und 11); LAN: TCP 8000 zum vLLM-Host (Advisor); Tailscale: UDP 41641 ausgehend, UDP 3478 (STUN), TCP 443 zu `login.tailscale.com`, `controlplane.tailscale.com`, `log.tailscale.com` und den DERP-Relays `derp*.tailscale.com`. Die Proxmox-Firewall filtert nach IP; Bitvavo und andere stehen hinter Cloudflare mit wechselnden IPs. Praktikabel ist deshalb: ausgehend nur die genannten Ports freigeben und die Hostliste als Dokumentation führen, oder IP-Sets per Skript aus DNS aktualisieren |
 | 9 Backup | Täglicher vzdump im Snapshot-Modus, `keep-daily 7, keep-weekly 4, keep-monthly 3`, auf PBS oder NAS; zusätzlich Off-Box-Kopie von `tradesv3.sqlite`, `fifo_lots.sqlite`, `decisions.jsonl`, Configs und CSV-Exporten. Bind-Mounts werden von vzdump nicht gesichert |
 | 10 Monitoring | `heartbeat.timer` pingt jede Minute eine Healthchecks-URL nach erfolgreichem `GET /api/v1/health`; Uptime Kuma (separater CT/VM) pollt die API über das Tailnet; Alarme an Telegram + ntfy (self-hosted mit `auth-default-access: deny-all`; iOS-Sofortpush braucht `upstream-base-url`) |
 | 11 Updates | Freqtrade-Version pinnen, monatliches Changelog lesen, erst im Dry-Run-Container aktualisieren |
@@ -647,7 +649,7 @@ PostgreSQL 16 bis 18 mit TimescaleDB 2.30 (nur PG 16 bis 18 unterstützt), ideal
 | DAC8-Abgleich zeigt hohes Bruttovolumen | sicher ab 2027 | Steuerreport, der die Meldung erklärt; jährlich erklären |
 | Gesetzesänderung (25 % Abgeltungsteuer ab 2027) | offen | Lots nach Anschaffungsdatum trennen |
 | LLM-Advisor verschlechtert Ergebnis | mittel | Schattenmodus, nur Gate, harte Limits in Code |
-| Kosten (Claude API, Steuertool, Zeit) übersteigen Gewinn | bei kleinem Kapital wahrscheinlich | Budget: ca. 2 bis 8 USD/Monat Advisor, 99 bis 149 EUR/Jahr Tool, claude.ai-Plan, deine Zeit |
+| Kosten (GPU-Strom für vLLM, Steuertool, Zeit) übersteigen Gewinn | bei 1.000 EUR Kapital wahrscheinlich | Budget: Strom des GPU-Hosts (nur bei Bedarf einschalten oder stündlich kurz laufen lassen), 49 bis 99 EUR/Jahr Steuertool, deine Zeit. Bei 1.000 EUR Kapital sind 5 % Jahresrendite 50 EUR; das Projekt ist ein Lernsystem |
 | Home-Lab-Ausfall (Container, Internet) bei offener Position | mittel | Bei Bitvavo kein Börsen-Stop möglich (Freqtrade-Doku: "not available"); Position liegt wie Buy-and-Hold, liegende Orders bleiben aktiv (Abschnitt 8.1). Minderung: Autostart, Watchdog, Alarm binnen 3 Minuten, Börsen-App für Notverkauf. Bei Kraken/OKX `stoploss_on_exchange` aktivieren und live mit Mini-Position testen, weil der Dry-Run keine Börsen-Stops platziert |
 | Stromausfall | mittel | USV mit NUT und geordnetem Shutdown des Hosts, `--onboot 1` und `--startup order=` für den Container, `Restart=always` für den Bot (Abschnitt 8, Schritte 1, 5, 14) |
 | Teilausführung bleibt als Mini-Position stehen | niedrig | `unfilledtimeout` sinnvoll setzen; `ledger.py` bucht jeden Fill einzeln; Restposition unter 5 EUR kann nicht verkauft werden und muss beim nächsten Trade mitgehen |
@@ -659,7 +661,7 @@ PostgreSQL 16 bis 18 mit TimescaleDB 2.30 (nur PG 16 bis 18 unterstützt), ideal
 | 0 Vorbereitung | Woche 1 bis 2 | Bitvavo-Konto, KYC, View-Key für Dry-Run; LXC, Tailscale, USV, Backup, Monitoring; Freqtrade installiert; Git-Repo; BTC/EUR-Historie aus Kraken-CSVs geladen | Alle Alarme getestet (Heartbeat-Ausfall, Neustart, Stromausfall-Simulation), Backup wiederhergestellt |
 | 1 Backtest | Woche 2 bis 4 | BtcTrend-Strategie, Backtest 2017 bis 2026 auf Kraken-Daten mit Bitvavo-Stufe-0-Gebühren + 5 bps, Hyperopt mit Konfigurationszähler, Lookahead/Recursive-Analyse, Claude reviewt Code und Ergebnisse | Strategie überlebt 2018 und 2022, OOS-Jahr nicht schlechter als B&H bei geringerem Max-Drawdown, < 45 Konfigurationen |
 | 2 Dry-Run | >= 3 Monate | `dry_run: true`, `dry_run_wallet` = Zielkapital, eigene DB; wöchentlicher Vergleich Dry-Run vs. Backtest; Steuer-Ledger und Dashboard laufen mit | Kein ungeklärter Drift, keine Störfälle, Ledger stimmt mit Börsen-Export überein |
-| 3 Advisor-Schatten (optional) | parallel zu 2, >= 6 Monate | Claude-Advisor loggt Entscheidungen, keine Wirkung; Vergleich gated vs. ungated | Gated-Variante mindestens gleich gut nach Kosten; sonst Advisor streichen |
+| 3 Advisor-Schatten (optional) | parallel zu 2, >= 6 Monate | vLLM-Advisor loggt Entscheidungen (`ADVISOR_MODE=shadow`), keine Wirkung; Vergleich gated vs. ungated | Gated-Variante mindestens gleich gut nach Kosten; sonst Advisor streichen |
 | 4 Live klein | 3 bis 6 Monate | 200 bis 500 EUR, Trade-Key anlegen, `max_open_trades 1`, fester Stake, Hard-Stop; Dry-Run läuft als Kontrollinstanz weiter; Teilausführung, Restart mit liegender Order und (bei Kraken/OKX) Börsen-Stop mit Mini-Position testen | Netto-Rendite pro Drawdown >= B&H im gleichen Fenster, Gebührenabfluss wie geplant, keine Abgleichfehler |
 | 5 Skalieren | ab Monat 9 bis 12 | Kapital stufenweise erhöhen, Steuerberater prüft ersten Jahresreport | Weiterhin Kriterien aus Phase 4; sonst zurück auf Phase 2 oder Projekt als Lernprojekt abschließen |
 
@@ -667,24 +669,26 @@ No-Go jederzeit: Kill-Switch ausgelöst, unerklärte Bilanzdifferenz, Börse mah
 
 ## 12. Offene Entscheidungen
 
-| Frage | Empfohlener Default |
+Stand 15.09.2026, Entscheidungen von Thomas: Hauptbörse Bitvavo; Startkapital 1.000 EUR; statische öffentliche IP vorhanden (API-Whitelist möglich); Proxmox VE 9.2.10 mit ZFS; USV vorhanden; Advisor lokal über vLLM. Die Tabelle zeigt den jeweiligen Stand.
+
+| Frage | Entscheidung / Empfohlener Default |
 |---|---|
-| Hauptbörse Bitvavo oder OKX Europe? | Bitvavo; OKX nur nach eigener Prüfung von Bot-AGB, Key-Scopes und SEPA |
+| Hauptbörse Bitvavo oder OKX Europe? | Entschieden: Bitvavo |
 | Börsen-Stop nötig? | Nein für die Tageskerzen-Strategie mit USV, Autostart und Alarm. Wenn du einen Stop auf der Börse willst, kippt die Börsenwahl zu Kraken (teurer) oder OKX (ungeprüft), weil Freqtrade `stoploss_on_exchange` bei Bitvavo nicht bietet |
 | Börsenseitiger Dead-Man's-Switch (`cancelOrdersAfter`)? | Aus. Storniert auch Exit-Orders. Erst in Phase 4 mit Mini-Position bewerten |
 | Zweitkonto bei Kraken? | Ja, aber erst in Phase 4, als Fallback |
-| Zielkapital? | Start 200 bis 500 EUR live; Gesamtbudget so, dass ein Totalverlust verkraftbar ist |
+| Zielkapital? | Entschieden: 1.000 EUR Startkapital (`dry_run_wallet` 1000, `START_CAPITAL_EUR` 1000). Live-Start in Phase 4 mit 200 bis 500 EUR davon, danach der Rest |
 | Handelspaar? | BTC/EUR; BTC/USDC trotz 0,10 % RT verworfen (Abschnitt 4.2); Gebührenwährung aus `feeCurrency` je Fill prüfen |
 | DCA-Bein? | Nur virtuell in `ledger.py` als Benchmark; echte DCA-Käufe nie im Bot-Konto |
 | Entscheidungsintervall? | Tageskerzen mit UTC-Schluss 00:00 (alternativ 4h); Polling 1 bis 5 Minuten nur für Monitoring |
 | Strategie? | 200-Tage-SMA-Trendfilter + Vol-Targeting, wöchentliches DCA als Benchmark |
-| Claude-Advisor überhaupt? | Erst Schattenmodus nach stabilem Dry-Run; Standard: nein im Live-Pfad |
-| Modell für den Advisor? | Sonnet 5 (`claude-sonnet-5`) für Kosten; Opus 5 nur testen, wenn das Schattenlog Qualitätslücken zeigt |
-| Anthropic-API-Key? | Nur anlegen, wenn Phase 3 startet; Pay-as-you-go, Budget-Limit im Anthropic-Konto setzen (ca. 2 bis 8 USD/Monat) |
-| claude.ai-Plan für Claude Code Routines? | Pro, Max oder Team nötig (Routines: Research Preview, Tageslimit); ohne Plan die Reviews manuell per Claude Code starten |
-| Statische IP vorhanden? | Prüfen; wenn nein: Trade-only-Key + kurze Laufzeit statt Whitelist, oder WireGuard-VPS |
-| Proxmox-Version und Storage? | `pveversion` prüfen: PVE >= 9.1, rootfs auf ZFS oder LVM-thin |
-| USV? | Ja, kleine Line-Interactive-USV mit USB und NUT auf dem Host |
+| Advisor überhaupt? | Entschieden: ja, lokal über vLLM, gebaut in Phase 0; läuft zunächst nur im Schattenmodus (`ADVISOR_MODE=shadow`) |
+| Modell für den Advisor? | Offen: hängt vom VRAM des GPU-Hosts ab, Empfehlungen in `docs/VLLM_ADVISOR.md`; Name in `ADVISOR_MODEL` eintragen |
+| GPU-Host für vLLM? | Offen: welche Maschine, welche GPU, welche IP; muss vom Container auf Port 8000 erreichbar sein |
+| Claude Code für Reviews? | Manuell per Sitzung auf dem Repo; Routines optional, wenn ein passender claude.ai-Plan vorhanden ist |
+| Statische IP vorhanden? | Entschieden: ja; alle Bitvavo-Keys mit IP-Whitelist anlegen |
+| Proxmox-Version und Storage? | Entschieden: PVE 9.2.10, rootfs auf ZFS (vzdump-Snapshot-Modus möglich) |
+| USV? | Entschieden: vorhanden; NUT-Anbindung nach `deploy/proxmox/nut/README.md` |
 | Dashboard? | FreqUI + kleine Ergänzungsseite; Grafana erst ab Phase 5 |
 | Benachrichtigung? | Telegram + ntfy (self-hosted), Healthchecks als Dead-Man's-Switch |
 | Steuertool? | Eigener FIFO-Report aus dem Ledger + Blockpit-Tier passend zur Trade-Zahl als Gegenprobe |
