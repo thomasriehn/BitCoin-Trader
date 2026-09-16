@@ -16,7 +16,9 @@ Verified against vLLM v0.29.0 (OpenAI-compatible server):
 
 Error policy (section 6): on any failure the error is logged, a line with
 ``error`` is appended to ``decisions.jsonl``, ``decision.json`` stays
-untouched and the exit code is 1.
+untouched and the exit code is 1. ``decision.json`` is written before the
+log line, so a line with ``error: null`` always means the decision became
+active; if the atomic write fails, the line carries the error instead.
 """
 
 from __future__ import annotations
@@ -37,8 +39,10 @@ from pydantic import ValidationError
 from btctrader.advisor import context as ctx_mod
 from btctrader.advisor.schema import RegimeDecision, response_format, response_json_schema
 from btctrader.common.config import Settings
-from btctrader.common.db import iso_utc, utcnow
+from btctrader.common.db import utcnow
 from btctrader.common.jsonl import append_jsonl, atomic_write_json
+
+iso_utc = ctx_mod.iso_seconds  # section 6 format: whole seconds, ``Z`` suffix
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +112,7 @@ class CallResult:
     latency_ms: int
     used_fallback: bool
     raw_content: str
+    finish_reason: str | None = None
 
 
 def _headers(api_key: str) -> dict[str, str]:
@@ -165,20 +170,36 @@ def call_model(
     if not isinstance(data, dict):
         raise AdvisorError(f"unexpected response payload: {_short(resp.text)}")
     return CallResult(
-        response=data, latency_ms=latency_ms, used_fallback=used_fallback, raw_content=extract_content(data)
+        response=data,
+        latency_ms=latency_ms,
+        used_fallback=used_fallback,
+        raw_content=extract_content(data),
+        finish_reason=extract_finish_reason(data),
     )
+
+
+def _first_choice(data: dict[str, Any]) -> dict[str, Any] | None:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return None
+    return choices[0]
 
 
 def extract_content(data: dict[str, Any]) -> str:
     """Assistant text of the first choice ('' if absent)."""
-    choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return ""
-    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    choice = _first_choice(data)
+    message = choice.get("message") if choice else None
     if not isinstance(message, dict):
         return ""
     content = message.get("content")
     return content if isinstance(content, str) else ""
+
+
+def extract_finish_reason(data: dict[str, Any]) -> str | None:
+    """``finish_reason`` of the first choice (``"length"`` means the answer hit ``max_tokens``)."""
+    choice = _first_choice(data)
+    reason = choice.get("finish_reason") if choice else None
+    return reason if isinstance(reason, str) else None
 
 
 def parse_decision(content: str) -> RegimeDecision:
@@ -239,11 +260,15 @@ def run_advisor(
     system_prompt: str | None = None,
     client: httpx.Client | None = None,
     market_client: httpx.Client | None = None,
-    ft_client: Any | None = None,
+    status_fn: ctx_mod.StatusFn | None = None,
     now: datetime | None = None,
 ) -> RunOutcome:
-    """One advisor cycle: context, model call, validation, files. Never raises on expected failures."""
-    created_at = now or utcnow()
+    """One advisor cycle: context, model call, validation, files. Never raises on expected failures.
+
+    ``status_fn`` is the read-only ``FreqtradeClient.status`` bound method (or
+    None); the advisor never receives the whole client.
+    """
+    created_at = (now or utcnow()).replace(microsecond=0)
     prompt = system_prompt if system_prompt is not None else load_system_prompt()
     prompt_hash = ctx_mod.sha256_prefixed(prompt)
     advisor_dir = Path(settings.advisor_dir)
@@ -257,7 +282,7 @@ def run_advisor(
 
     try:
         if context is None:
-            context = ctx_mod.build_context(client=market_client, ft=ft_client, now=created_at)
+            context = ctx_mod.build_context(client=market_client, status=status_fn, now=created_at)
         atomic_write_json(advisor_dir / CONTEXT_FILE, context)
     except Exception as exc:  # noqa: BLE001 - any context failure is reported the same way
         return _fail(advisor_dir, record, f"context: {exc.__class__.__name__}: {exc}")
@@ -286,7 +311,10 @@ def run_advisor(
     try:
         decision = parse_decision(call.raw_content)
     except AdvisorError as exc:
-        return _fail(advisor_dir, record, str(exc))
+        error = str(exc)
+        if call.finish_reason == "length":
+            error = f"answer truncated at max_tokens={MAX_TOKENS} (finish_reason=length): {error}"
+        return _fail(advisor_dir, record, error)
 
     valid_until = created_at + timedelta(hours=2 * settings.advisor_interval_hours)
     decision_doc: dict[str, Any] = {
@@ -307,12 +335,25 @@ def run_advisor(
     extra_keys = ("latency_ms", "usage", "raw_response", "used_guided_json_fallback")
     log_line = {**decision_doc, **{k: record[k] for k in extra_keys}}
     log_line["error"] = None
+    # decision.json first: the log line must state whether the decision became active.
     try:
-        append_jsonl(advisor_dir / DECISIONS_LOG, log_line)
         atomic_write_json(advisor_dir / DECISION_FILE, decision_doc)
     except OSError as exc:
-        log.error("error=%s", f"cannot write advisor files in {advisor_dir}: {exc}")
-        return RunOutcome(exit_code=1, decision=decision_doc, error=str(exc), log_record=log_line)
+        error = f"cannot write {DECISION_FILE}: {exc}"
+        log.error("error=%s", error)
+        log_line["error"] = error
+        try:
+            append_jsonl(advisor_dir / DECISIONS_LOG, log_line)
+        except OSError as exc2:
+            log.error("error=%s", f"cannot append to {advisor_dir / DECISIONS_LOG}: {exc2}")
+        return RunOutcome(exit_code=1, decision=None, error=error, log_record=log_line)
+    try:
+        append_jsonl(advisor_dir / DECISIONS_LOG, log_line)
+    except OSError as exc:
+        # decision.json is active but unlogged: report loudly, systemd sees exit 1.
+        error = f"{DECISION_FILE} written but cannot append to {DECISIONS_LOG}: {exc}"
+        log.error("error=%s", error)
+        return RunOutcome(exit_code=1, decision=decision_doc, error=error, log_record=log_line)
     log.info(
         "decision %s regime=%s confidence=%.2f horizon=%dd mode=%s latency=%dms",
         decision_doc["decision_id"],

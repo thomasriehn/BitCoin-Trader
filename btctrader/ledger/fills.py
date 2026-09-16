@@ -16,13 +16,36 @@ import json
 import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 
+from btctrader.common.db import parse_iso
 from btctrader.ledger.errors import ChainError, LedgerError
 
 Q8 = Decimal("0.00000001")
 EXCHANGE = "bitvavo"
 PAIR = "BTC/EUR"
+
+# Fixed-width timestamp format for ``ts_utc`` so that string order equals time order.
+TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+# sync_state key prefix holding "<row count>:<row_hash of the last inserted row>" per chain scope.
+STATE_CHAIN_TAIL = "chain_tail"
+
+
+def normalize_ts(ts: str) -> str:
+    """Canonical ``ts_utc``: UTC, always six fractional digits, ``Z`` suffix.
+
+    Applied to every fill regardless of how the caller formatted the timestamp
+    (an earlier ``iso_utc`` dropped a zero fraction, mixing ``HH:MM:SSZ`` and
+    ``HH:MM:SS.ffffffZ`` rows; because ``Z`` sorts after ``.`` a whole-second
+    fill then sorted *after* a later fill of the same second).
+    """
+    return parse_iso(ts).strftime(TS_FORMAT)
+
+
+def chain_tail_key(exchange: str, account_id: str) -> str:
+    return f"{STATE_CHAIN_TAIL}:{exchange}:{account_id}"
+
 
 # Fields protected by the hash chain (in hashing order).
 BUSINESS_FIELDS: tuple[str, ...] = (
@@ -178,13 +201,17 @@ class Fill:
         gross = q8(amount * price)
         fee_eur = fee_amt if fee_currency == "EUR" else q8(fee_amt * price)
         net = gross + fee_eur if side == "buy" else gross - fee_eur
+        try:
+            ts_norm = normalize_ts(ts_utc)
+        except ValueError as exc:
+            raise LedgerError(f"fill {exchange_trade_id}: invalid timestamp {ts_utc!r}") from exc
         return cls(
             source=source,
             exchange=exchange,
             account_id=account_id,
             exchange_trade_id=str(exchange_trade_id),
             exchange_order_id=str(exchange_order_id) if exchange_order_id is not None else None,
-            ts_utc=ts_utc,
+            ts_utc=ts_norm,
             pair=pair,
             side=side,
             amount_btc=amount,
@@ -261,9 +288,18 @@ class Fill:
         )
 
 
-def sort_key(fill: Fill) -> tuple[str, str]:
-    """Canonical processing order: exchange timestamp, then exchange trade id."""
-    return (fill.ts_utc, fill.exchange_trade_id)
+def sort_key(fill: Fill) -> tuple[datetime, str]:
+    """Canonical processing order: exchange timestamp (parsed, so rows stored before
+    ``normalize_ts`` existed still sort by time), then exchange trade id."""
+    return (parse_iso(fill.ts_utc), fill.exchange_trade_id)
+
+
+def _comparable_business_values(fill: Fill) -> dict[str, str | int | None]:
+    """Business values with ``ts_utc`` normalised, so legacy rows written with a
+    whole-second timestamp compare equal to the same fill fetched again."""
+    values = fill.business_values()
+    values["ts_utc"] = normalize_ts(fill.ts_utc)
+    return values
 
 
 # -- hashing -------------------------------------------------------------------------
@@ -282,11 +318,17 @@ def load_fills(conn: sqlite3.Connection, account_id: str, exchange: str = EXCHAN
         "SELECT * FROM fills WHERE exchange = ? AND account_id = ? ORDER BY ts_utc, exchange_trade_id",
         (exchange, account_id),
     ).fetchall()
-    return [Fill.from_row(r) for r in rows]
+    # Python sort by parsed time: SQL string order is wrong for mixed-precision legacy rows.
+    return sorted((Fill.from_row(r) for r in rows), key=sort_key)
 
 
 def verify_chain(conn: sqlite3.Connection, account_id: str, exchange: str = EXCHANGE) -> list[str]:
-    """Recompute the hash chain in insertion order and return a list of problems (empty = intact)."""
+    """Recompute the hash chain in insertion order and return a list of problems (empty = intact).
+
+    Besides the row-to-row links this compares the recomputed tail (row count and
+    last ``row_hash``) with the anchor ``upsert_fills`` stored in ``sync_state``,
+    so deleting the newest row (which leaves a valid chain) is detected too.
+    """
     rows = conn.execute(
         "SELECT * FROM fills WHERE exchange = ? AND account_id = ? ORDER BY id",
         (exchange, account_id),
@@ -307,7 +349,24 @@ def verify_chain(conn: sqlite3.Connection, account_id: str, exchange: str = EXCH
                 "(business fields were modified after insertion)"
             )
         prev = fill.row_hash
+    tail_problem = _tail_problem(conn, exchange, account_id, len(rows), prev)
+    if tail_problem:
+        problems.append(tail_problem)
     return problems
+
+
+def _tail_problem(
+    conn: sqlite3.Connection, exchange: str, account_id: str, count: int, last_hash: str | None
+) -> str | None:
+    """Compare the actual tail of a scope with the anchor in ``sync_state`` (None = consistent)."""
+    anchor = get_state(conn, chain_tail_key(exchange, account_id))
+    if anchor is None or anchor == f"{count}:{last_hash or ''}":
+        return None
+    stored_count, _, stored_hash = anchor.partition(":")
+    return (
+        f"chain tail mismatch: sync_state records {stored_count} rows ending in {stored_hash!r}, "
+        f"table has {count} rows ending in {last_hash!r} (rows deleted or reinserted?)"
+    )
 
 
 def assert_chain(conn: sqlite3.Connection, account_id: str, exchange: str = EXCHANGE) -> None:
@@ -355,6 +414,9 @@ def upsert_fills(conn: sqlite3.Connection, fills: Iterable[Fill]) -> UpsertResul
     incoming: Sequence[Fill] = sorted(fills, key=sort_key)
     last_hashes: dict[tuple[str, str], str | None] = {}
     with conn:
+        # Take the write lock before reading the chain state: a second sync running at
+        # the same time then waits (busy timeout) instead of chaining onto a stale prev_hash.
+        begin_immediate(conn)
         for fill in incoming:
             scope = (fill.exchange, fill.account_id)
             existing = conn.execute(
@@ -363,7 +425,7 @@ def upsert_fills(conn: sqlite3.Connection, fills: Iterable[Fill]) -> UpsertResul
             ).fetchone()
             if existing is not None:
                 stored = Fill.from_row(existing)
-                if stored.business_values() != fill.business_values():
+                if _comparable_business_values(stored) != _comparable_business_values(fill):
                     result.conflicts.append(  # type: ignore[union-attr]
                         f"{fill.exchange_trade_id}: stored business fields differ from incoming data"
                     )
@@ -384,6 +446,10 @@ def upsert_fills(conn: sqlite3.Connection, fills: Iterable[Fill]) -> UpsertResul
                 continue
             if scope not in last_hashes:
                 last_hashes[scope] = _last_hash(conn, *scope)
+                # Never extend a chain whose tail no longer matches the anchor (deleted rows).
+                problem = _tail_problem(conn, *scope, _row_count(conn, *scope), last_hashes[scope])
+                if problem:
+                    raise ChainError("hash chain broken: " + problem)
             prev = last_hashes[scope]
             chained = replace(fill, prev_hash=prev, row_hash=compute_row_hash(fill, prev))
             row = chained.to_row()
@@ -392,16 +458,47 @@ def upsert_fills(conn: sqlite3.Connection, fills: Iterable[Fill]) -> UpsertResul
             conn.execute(f"INSERT INTO fills ({columns}) VALUES ({placeholders})", tuple(row.values()))
             last_hashes[scope] = chained.row_hash
             result.inserted += 1
+        for scope in last_hashes:
+            _record_chain_tail(conn, *scope)
     return result
+
+
+def _row_count(conn: sqlite3.Connection, exchange: str, account_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM fills WHERE exchange = ? AND account_id = ?", (exchange, account_id)
+    ).fetchone()
+    return int(row["n"])
+
+
+def _record_chain_tail(conn: sqlite3.Connection, exchange: str, account_id: str) -> None:
+    """Store row count and last row_hash of a scope as the anchor ``verify_chain`` checks."""
+    tail = _last_hash(conn, exchange, account_id) or ""
+    count = _row_count(conn, exchange, account_id)
+    _set_state_nocommit(conn, chain_tail_key(exchange, account_id), f"{count}:{tail}")
+
+
+def begin_immediate(conn: sqlite3.Connection) -> None:
+    """Start a write transaction now (no-op when one is already open)."""
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+
+
+def _set_state_nocommit(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO sync_state (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
 
 
 def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
     with conn:
-        conn.execute(
-            "INSERT INTO sync_state (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
+        _set_state_nocommit(conn, key, value)
+
+
+def delete_state(conn: sqlite3.Connection, key: str) -> None:
+    with conn:
+        conn.execute("DELETE FROM sync_state WHERE key = ?", (key,))
 
 
 def get_state(conn: sqlite3.Connection, key: str) -> str | None:

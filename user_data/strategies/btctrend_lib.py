@@ -63,12 +63,13 @@ def realized_volatility(
     return window_std * math.sqrt(periods_per_year)
 
 
-def exposure_from_vol(target_vol: float, realized_vol: float | None, fallback: float = 1.0) -> float:
+def exposure_from_vol(target_vol: float, realized_vol: float | None, fallback: float = 0.0) -> float:
     """Volatility-targeted exposure ``min(1, target_vol / realized_vol)``.
 
-    Returns ``fallback`` when the realized volatility is unknown (None or NaN)
-    and 1.0 when it is zero (a flat market carries no measured risk). The result
-    is always within ``[0, 1]``.
+    Returns ``fallback`` (default 0.0: no exposure without a volatility estimate;
+    the rule never fails open to 100 %) when the realized volatility is unknown
+    (None or NaN) and 1.0 when it is zero (a flat market carries no measured
+    risk). The result is always within ``[0, 1]``.
     """
     if target_vol <= 0:
         raise ValueError("target_vol must be > 0")
@@ -119,6 +120,40 @@ def rebalance_amount(
     if order_value < 0 and -order_value > position_value:
         order_value = -position_value
     return order_value
+
+
+def partial_exit_stake(sell_fraction: float, trade_stake_amount: float) -> float:
+    """Translate "sell this fraction of the position" into Freqtrade's partial-exit value.
+
+    Freqtrade (2026.8, ``freqtradebot.check_and_call_adjust_trade_position`` and
+    ``optimize.backtesting._check_adjust_trade_for_candle``) converts a negative
+    ``adjust_trade_position`` result to a base amount of
+    ``|stake| * trade.amount / trade.stake_amount``, i.e. relative to the invested
+    cost basis, not to the current position value. Returning
+    ``-sell_fraction * trade.stake_amount`` therefore sells exactly
+    ``sell_fraction * trade.amount`` at any price. ``sell_fraction`` is clipped to
+    ``[0, 1]``; 1.0 flattens the trade (remainder 0, Freqtrade closes it).
+    """
+    if trade_stake_amount <= 0:
+        raise ValueError("trade_stake_amount must be > 0")
+    return -_clip01(sell_fraction) * trade_stake_amount
+
+
+def exit_min_stake(min_stake: float, stoploss: float) -> float:
+    """Minimum remainder Freqtrade accepts after a partial exit.
+
+    ``adjust_trade_position`` receives ``min_stake`` computed with stoploss 0
+    (live) or -0.1 (backtest), while the remainder check in Freqtrade uses the
+    strategy stoploss: ``exchange._get_stake_amount_limit`` multiplies the
+    exchange minimum by ``(1 + reserve) / (1 - |stoploss|)``, capped at 1.5.
+    Applying the same factor here (on top of the given value, so slightly
+    conservative in backtesting) keeps a partial exit from being refused.
+    """
+    if min_stake < 0:
+        raise ValueError("min_stake must be >= 0")
+    sl = abs(stoploss)
+    factor = 1.5 if sl >= 1 else min(1.5, 1.0 / (1.0 - sl))
+    return min_stake * factor
 
 
 def candles_held(open_date: datetime, now: datetime, timeframe_minutes: int) -> int:

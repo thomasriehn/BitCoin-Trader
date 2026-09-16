@@ -1,0 +1,87 @@
+# Proxmox VE firewall for the trading container (CT 210, "btc-bot").
+# Install as /etc/pve/firewall/210.fw on the PVE host (create-lxc.sh does that when the file
+# is missing). Format: https://pve.proxmox.com/pve-docs/chapter-pve-firewall.html
+#
+# The rules only take effect when BOTH are true:
+#   * the datacenter firewall is enabled: /etc/pve/firewall/cluster.fw has "enable: 1" in [OPTIONS]
+#     (enabling it adds the local cluster network to the "management" IP set, so the PVE GUI on
+#     8006 and SSH to the host keep working; check the host firewall rules anyway before you
+#     close the session),
+#   * net0 of the container carries firewall=1 (create-lxc.sh sets it).
+#
+# Policy: default DROP in both directions, then an explicit allowlist. Connection tracking is
+# on, so replies to allowed outbound connections come back without extra rules.
+#
+# IP versus hostname (read this before you tighten the rules further):
+#   The PVE firewall filters on IP addresses. The hosts the bot talks to (api.bitvavo.com,
+#   ws.bitvavo.com, api.telegram.org, hc-ping.com, api.coingecko.com, pypi.org,
+#   files.pythonhosted.org, github.com, deb.debian.org, login/controlplane/log.tailscale.com,
+#   derp*.tailscale.com) sit behind Cloudflare or other CDNs with changing addresses. Pinning
+#   them to IPs here would break the bot at random. This file therefore allows the PORTS
+#   (443, 80, DNS, Tailscale UDP) to any destination and keeps the host list as documentation.
+#   The container itself has no service listening on the LAN except SSH (optional) and the
+#   Tailscale UDP port, and no exchange key with withdraw rights, so the outbound allowlist
+#   is defence in depth, not the primary control. If you want real host pinning, generate
+#   an IP set from DNS with a cron job on the host and reference it as +guest/exchange below.
+
+[OPTIONS]
+enable: 1
+policy_in: DROP
+policy_out: DROP
+log_level_in: nolog
+log_level_out: nolog
+dhcp: 0
+ndp: 1
+macfilter: 1
+ipfilter: 0
+
+[ALIASES]
+# Adjust these three to your network.
+vllm_host 192.168.1.50
+lan_admin 192.168.1.0/24
+resolver 192.168.1.1
+
+[IPSET tailnet]
+# Tailscale CGNAT range. Not needed for normal operation: Tailscale traffic reaches the CT as
+# WireGuard UDP on eth0, the 100.64.0.0/10 addresses only exist inside the tunnel. Kept for the
+# case that you ever route the tailnet into the LAN (subnet router) and want to allow it here.
+100.64.0.0/10
+
+[RULES]
+# ---- inbound (only from the LAN admin subnet, everything else is DROP) ----
+IN ACCEPT -source lan_admin -p tcp -dport 22 -log nolog # SSH from the LAN, optional (pct enter works without it)
+IN ACCEPT -source lan_admin -p icmp -icmp-type echo-request -log nolog # ping from the LAN
+IN ACCEPT -p udp -dport 41641 -log nolog # Tailscale direct connections; without it peers fall back to DERP relays (still works)
+|IN ACCEPT -source +guest/tailnet -p tcp -dport 8080,8090 -log nolog # disabled: FreqUI/dashboard bind to 127.0.0.1 and are published with tailscale serve
+
+# ---- outbound: DNS ----
+OUT ACCEPT -dest resolver -p udp -dport 53 -log nolog
+OUT ACCEPT -dest resolver -p tcp -dport 53 -log nolog
+
+# ---- outbound: HTTPS (hosts see the comment at the top) ----
+# api.bitvavo.com, ws.bitvavo.com (exchange REST + WebSocket)
+# api.telegram.org (Freqtrade Telegram bot and btctrader alerts)
+# hc-ping.com or your own Healthchecks host (heartbeat)
+# api.coingecko.com (Freqtrade EUR conversion while fiat_display_currency is set)
+# pypi.org, files.pythonhosted.org, github.com (install.sh, install-ui, updates)
+# login.tailscale.com, controlplane.tailscale.com, log.tailscale.com, derp*.tailscale.com
+# cdn.jsdelivr.net (dashboard vendor JS, only during install.sh)
+OUT ACCEPT -p tcp -dport 443 -log nolog
+
+# ---- outbound: HTTP (apt mirrors deb.debian.org and security.debian.org are plain http) ----
+OUT ACCEPT -p tcp -dport 80 -log nolog
+
+# ---- outbound: vLLM advisor on the GPU host in the LAN ----
+OUT ACCEPT -dest vllm_host -p tcp -dport 8000 -log nolog
+
+# ---- outbound: Tailscale ----
+OUT ACCEPT -p udp -dport 41641 -log nolog # WireGuard to peers (direct)
+OUT ACCEPT -p udp -dport 3478 -log nolog # STUN
+# Peers behind NAT may use other UDP ports; if direct connections matter to you, open
+# "OUT ACCEPT -p udp" broadly. Otherwise DERP over TCP 443 carries the traffic.
+
+# ---- outbound: diagnostics ----
+OUT ACCEPT -p icmp -icmp-type echo-request -log nolog
+
+# Everything else is dropped by policy_in / policy_out. Note that the container has no NTP
+# client: the clock comes from the host kernel, keep chrony healthy on the host.

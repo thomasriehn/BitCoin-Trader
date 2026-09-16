@@ -1,0 +1,29 @@
+# Daily ledger run: sync fills (Freqtrade DB or exchange), equity snapshot with benchmarks,
+# export of the previous month's CSV when the month changed. Only this unit writes ledger.sqlite.
+# Started by btctrader-ledger.timer (00:20 UTC). Needs BENCHMARK_START in btctrader.env.
+[Unit]
+Description=btctrader ledger daily (sync, snapshot, export)
+Documentation=file:///srv/trading/repo/docs/BETRIEB.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=freqtrade
+Group=freqtrade
+UMask=0027
+WorkingDirectory=/srv/trading
+EnvironmentFile=/etc/freqtrade/btctrader.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/srv/trading/venv/bin/btctrader-ledger daily
+TimeoutStartSec=15min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# user_data stays writable: the Freqtrade DB (WAL) is opened mode=ro, but SQLite must still
+# create the -shm file when the bot is stopped, and that fails on a read-only mount.
+ReadWritePaths=/srv/trading/ledger /srv/trading/user_data
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true

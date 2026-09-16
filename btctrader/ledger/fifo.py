@@ -28,7 +28,7 @@ from dateutil.relativedelta import relativedelta
 
 from btctrader.common.db import parse_iso
 from btctrader.ledger.errors import FifoError
-from btctrader.ledger.fills import Fill, fmt, load_fills, q8, sort_key
+from btctrader.ledger.fills import Fill, begin_immediate, fmt, load_fills, q8, sort_key
 
 PRE_2027_CUTOFF = date(2027, 1, 1)
 ZERO = Decimal(0)
@@ -208,10 +208,16 @@ def compute_fifo(fills: Sequence[Fill], account_id: str) -> FifoResult:
 
 
 def rebuild(conn: sqlite3.Connection, account_id: str) -> FifoResult:
-    """Clear ``lots`` and ``disposals`` of the account and rebuild them from all stored fills."""
-    fills = load_fills(conn, account_id)
-    result = compute_fifo(fills, account_id)
+    """Clear ``lots`` and ``disposals`` of the account and rebuild them from all stored fills.
+
+    Runs inside one immediate (write) transaction so a concurrent sync cannot insert
+    fills between reading them and rewriting the tables. On ``FifoError`` nothing
+    is changed: the previous lots and disposals stay in place.
+    """
     with conn:
+        begin_immediate(conn)
+        fills = load_fills(conn, account_id)
+        result = compute_fifo(fills, account_id)
         conn.execute("DELETE FROM disposals WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM lots WHERE account_id = ?", (account_id,))
         # Lot ids are assigned per rebuild; offset them so several accounts never collide.
@@ -283,7 +289,7 @@ def load_disposals(
         sql += " AND taxable = 1"
     sql += " ORDER BY disposed_at, id"
     rows = conn.execute(sql, params).fetchall()
-    return [
+    disposals = [
         Disposal(
             id=int(r["id"]),
             account_id=str(r["account_id"]),
@@ -303,6 +309,8 @@ def load_disposals(
         )
         for r in rows
     ]
+    # Sort by parsed time: legacy rows may mix whole-second and fractional timestamps.
+    return sorted(disposals, key=lambda d: (parse_iso(d.disposed_at), d.id))
 
 
 def load_lots(conn: sqlite3.Connection, account_id: str, *, open_only: bool = False) -> list[Lot]:
@@ -329,4 +337,5 @@ def load_lots(conn: sqlite3.Connection, account_id: str, *, open_only: bool = Fa
                 pre_2027=int(r["pre_2027"]),
             )
         )
+    lots.sort(key=lambda lot: (parse_iso(lot.acquired_at), lot.lot_id))
     return [lot for lot in lots if not open_only or lot.remaining_qty > 0]

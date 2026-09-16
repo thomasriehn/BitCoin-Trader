@@ -10,7 +10,7 @@ import pytest
 
 from btctrader.ledger.errors import FifoError
 from btctrader.ledger.fifo import compute_fifo, holding_status, load_disposals, load_lots, rebuild
-from btctrader.ledger.fills import load_fills
+from btctrader.ledger.fills import Fill, compute_row_hash, load_fills, upsert_fills
 from tests.ledger.conftest import ACCOUNT, make_fill, store
 
 
@@ -184,3 +184,22 @@ def test_other_accounts_are_isolated(ledger_conn: sqlite3.Connection) -> None:
     assert len(lots) == 1 and lots[0].qty_btc == Decimal("0.5")
     assert len(others) == 1 and others[0].qty_btc == Decimal("0.7")
     assert lots[0].lot_id != others[0].lot_id
+
+
+def test_legacy_whole_second_rows_sort_by_time_not_by_string(ledger_conn: sqlite3.Connection) -> None:
+    """Rows stored before ts_utc had a fixed precision ('...:00Z') sort after '...:00.250000Z' as
+    strings although they are earlier; ordering, FIFO and idempotent re-sync must still be right."""
+    legacy = make_fill("b1", "2026-01-01T10:00:00.000000Z", "buy", "0.02", "50000")
+    legacy = Fill(**{**{f: getattr(legacy, f) for f in legacy.__slots__}, "ts_utc": "2026-01-01T10:00:00Z"})
+    assert legacy.ts_utc == "2026-01-01T10:00:00Z"
+    upsert_fills(ledger_conn, [legacy])
+    store(ledger_conn, [make_fill("s1", "2026-01-01T10:00:00.250000Z", "sell", "0.01", "50100")])
+    stored = load_fills(ledger_conn, ACCOUNT)
+    assert [f.exchange_trade_id for f in stored] == ["b1", "s1"]
+    assert stored[0].ts_utc == "2026-01-01T10:00:00Z"  # stored text (and its hash) is untouched
+    assert stored[0].row_hash == compute_row_hash(stored[0], None)
+    result = rebuild(ledger_conn, ACCOUNT)
+    assert result.btc_held == Decimal("0.01") and len(result.disposals) == 1
+    # The same fill fetched again (now normalised) is recognised, not flagged as a conflict.
+    again = upsert_fills(ledger_conn, [make_fill("b1", "2026-01-01T10:00:00Z", "buy", "0.02", "50000")])
+    assert (again.inserted, again.unchanged, again.conflict_count) == (0, 1, 0)

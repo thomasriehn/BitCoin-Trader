@@ -21,6 +21,7 @@ ENV_FILE_VAR = "BTCTRADER_ENV_FILE"
 
 LEDGER_SOURCES = ("freqtrade-db", "exchange")
 ADVISOR_MODES = ("shadow", "gate")
+WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "*", "0", "::0"})
 
 _TRUE = {"1", "true", "yes", "on", "y"}
 _FALSE = {"0", "false", "no", "off", "n", ""}
@@ -78,45 +79,149 @@ class Settings:
 FIELD_NAMES: tuple[str, ...] = tuple(f.name for f in fields(Settings))
 
 
-def parse_env_file(path: str | Path) -> dict[str, str]:
-    """Parse a simple ``KEY=VALUE`` env file (systemd EnvironmentFile style).
+# Characters that a backslash unescapes inside double quotes (systemd SHELL_NEED_ESCAPE);
+# any other escaped character keeps its backslash, as in a POSIX shell.
+_DQUOTE_UNESCAPE = '"\\`$'
 
-    Supports comments, blank lines, an optional ``export`` prefix and single or
-    double quotes around the value. Unknown lines are ignored.
+
+def parse_env_file(path: str | Path) -> dict[str, str]:
+    """Parse a ``KEY=VALUE`` env file with the semantics of systemd ``EnvironmentFile=``.
+
+    The same file is read by the systemd units and by the manual CLI runs, so
+    both must see identical values. Rules (port of systemd ``src/basic/env-file.c``):
+
+    * Lines whose first non-blank character is ``#`` or ``;`` are comments.
+      ``#`` is **not** special inside a value: ``A=abc #def`` yields ``abc #def``.
+    * Unquoted values: leading and trailing whitespace is stripped, ``\\x`` yields
+      ``x`` for any character, an escaped newline continues the line.
+    * ``'...'``: taken literally, no escapes.
+    * ``"..."``: ``\\"``, ``\\\\``, ``\\```, ``\\$`` are unescaped, other backslashes are kept,
+      an escaped newline is removed.
+    * Text after a closing quote is appended (surrounding blanks dropped).
+    * Keys must match ``[A-Za-z_][A-Za-z0-9_]*``; other lines are ignored.
+      An ``export`` prefix is tolerated (systemd would ignore such lines).
     """
     result: dict[str, str] = {}
     text = Path(path).read_text(encoding="utf-8")
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
+    for key, value in _env_file_entries(text):
+        if key.startswith("export ") or key.startswith("export\t"):
+            key = key[len("export") :].strip()
+        if not key or not (key[0].isalpha() or key[0] == "_") or not key.replace("_", "").isalnum():
             continue
-        if line.startswith("export "):
-            line = line[len("export ") :].strip()
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not key or not key.replace("_", "").isalnum():
-            continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
-        else:
-            # Strip trailing unquoted comments: FOO=bar  # comment
-            hash_pos = value.find(" #")
-            if hash_pos >= 0:
-                value = value[:hash_pos].rstrip()
         result[key] = value
     return result
 
 
+def _env_file_entries(text: str) -> list[tuple[str, str]]:
+    """Character state machine mirroring systemd's env-file parser; returns (key, value) pairs."""
+    entries: list[tuple[str, str]] = []
+    state = "pre_key"
+    key: list[str] = []
+    value: list[str] = []
+    last_value_ws: int | None = None  # index where trailing whitespace of an unquoted value starts
+
+    def push() -> None:
+        nonlocal key, value, last_value_ws
+        val = "".join(value)
+        if last_value_ws is not None:
+            val = val[:last_value_ws]
+        entries.append(("".join(key).rstrip(), val))
+        key, value, last_value_ws = [], [], None
+
+    for c in text:
+        newline = c in "\n\r"
+        blank = c in " \t\n\r"
+        if state == "pre_key":
+            if c in "#;":
+                state = "comment"
+            elif not blank:
+                state, key = "key", [c]
+        elif state == "key":
+            if newline:
+                state, key = "pre_key", []
+            elif c == "=":
+                state, last_value_ws = "pre_value", None
+            else:
+                key.append(c)
+        elif state == "pre_value":
+            if newline:
+                push()
+                state = "pre_key"
+            elif c == "'":
+                state = "squote"
+            elif c == '"':
+                state = "dquote"
+            elif c == "\\":
+                state = "value_escape"
+            elif not blank:
+                state = "value"
+                value.append(c)
+        elif state == "value":
+            if newline:
+                push()
+                state = "pre_key"
+            elif c == "\\":
+                state, last_value_ws = "value_escape", None
+            else:
+                if not blank:
+                    last_value_ws = None
+                elif last_value_ws is None:
+                    last_value_ws = len(value)
+                value.append(c)
+        elif state == "value_escape":
+            state = "value"
+            if not newline:  # an escaped newline is eaten entirely
+                value.append(c)
+        elif state == "squote":
+            if c == "'":
+                state = "pre_value"
+            else:
+                value.append(c)
+        elif state == "dquote":
+            if c == '"':
+                state = "pre_value"
+            elif c == "\\":
+                state = "dquote_escape"
+            else:
+                value.append(c)
+        elif state == "dquote_escape":
+            state = "dquote"
+            if c in _DQUOTE_UNESCAPE:
+                value.append(c)
+            elif c != "\n":
+                value.append("\\")
+                value.append(c)
+        elif state == "comment":
+            if c == "\\":
+                state = "comment_escape"
+            elif newline:
+                state = "pre_key"
+        elif state == "comment_escape":
+            state = "pre_key" if newline else "comment"
+    if state in ("pre_value", "value", "value_escape", "squote", "dquote", "dquote_escape"):
+        push()  # last line without a trailing newline
+    return entries
+
+
 def _merged_env(env: Mapping[str, str] | None) -> dict[str, str]:
-    """Combine env-file values with the process environment (environment wins)."""
+    """Combine env-file values with the environment (environment wins).
+
+    With ``env=None`` the process environment is used and ``DEFAULT_ENV_FILE``
+    is read when present. An explicit mapping is hermetic: only an env file it
+    names itself via ``BTCTRADER_ENV_FILE`` is consulted, never the host's
+    ``/etc/freqtrade/btctrader.env`` (tests must not depend on the host).
+    """
     base: Mapping[str, str] = os.environ if env is None else env
     merged: dict[str, str] = {}
     env_file = base.get(ENV_FILE_VAR, "").strip()
-    candidate = Path(env_file) if env_file else DEFAULT_ENV_FILE
-    if candidate.is_file():
+    candidate: Path | None
+    if env_file:
+        candidate = Path(env_file)
+    elif env is None:
+        candidate = DEFAULT_ENV_FILE
+    else:
+        candidate = None
+    if candidate is not None and candidate.is_file():
         try:
             merged.update(parse_env_file(candidate))
         except OSError as exc:
@@ -171,12 +276,17 @@ def _parse_date(name: str, raw: str) -> date:
 
 
 def _convert(field_name: str, field_type: str, raw: str, default: Any) -> Any:
-    """Convert a raw string to the field's type. Empty strings keep the default for non-str fields."""
+    """Convert a raw string to the field's type. An empty value means "use the default" for every field.
+
+    This keeps ``LEDGER_SOURCE=`` or ``TZ_DISPLAY=`` in the env file harmless
+    (they are natural placeholders) instead of yielding ``""`` for string
+    fields but the default for typed fields.
+    """
     env_name = field_name.upper()
-    if field_type == "str":
-        return raw.strip()
     if raw.strip() == "":
         return default
+    if field_type == "str":
+        return raw.strip()
     if field_type == "Path":
         return Path(raw.strip()).expanduser()
     if field_type == "int":
@@ -231,6 +341,13 @@ def _validate(values: dict[str, Any]) -> list[str]:
     host, sep, port = bind.rpartition(":")
     if not sep or not host or not port.isdigit() or not (0 < int(port) < 65536):
         problems.append("DASHBOARD_BIND must look like host:port, e.g. 127.0.0.1:8090")
+    elif host.strip("[]") in WILDCARD_HOSTS:
+        # The dashboard has no login (KOMPONENTEN.md section 10): it must only listen on
+        # loopback or the Tailscale address, never on every interface.
+        problems.append(
+            f"DASHBOARD_BIND must not listen on all interfaces ({host}); the dashboard has no login,"
+            " bind to 127.0.0.1 or the Tailscale address"
+        )
     return problems
 
 

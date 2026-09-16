@@ -1,36 +1,67 @@
 # BitCoin-Trader
 
-Automatisierter, gebührenbewusster Bitcoin-Spot-Handel (BTC/EUR) auf einem Proxmox-LXC-Container, mit Depot-Übersicht und Claude als Strategie-, Code- und Review-Partner.
+Automatisierter, gebührenbewusster Bitcoin-Spot-Handel (BTC/EUR bei Bitvavo) auf einem Proxmox-LXC-Container, mit steuerfähigem Handelsprotokoll, Risikowächter, lokalem vLLM-Advisor und Depot-Übersicht. Claude wirkt als Strategie-, Code- und Review-Partner, nicht als Live-Entscheider.
 
 ## Status
 
-Planungsphase. Es gibt noch keinen Code. Der vollständige, quellenbelegte Projektplan liegt in [docs/PROJEKTPLAN.md](docs/PROJEKTPLAN.md) (Stand 15.09.2026).
+Phase 0 ist gebaut: Alle Bauteile sind implementiert, getestet und gegengeprüft. Es lief noch kein Dry-Run auf echter Hardware. Nächster Schritt ist die Einrichtung nach [docs/SETUP.md](docs/SETUP.md).
 
-## Die vier Ausgangsfragen in Kürze
+Entscheidungen (15.09.2026): Börse Bitvavo, Startkapital 1.000 EUR, statische IP, Proxmox VE 9.2.10 mit ZFS, USV vorhanden, Advisor lokal über vLLM.
 
-| Frage | Antwort (Details im Projektplan) |
+## Dokumente
+
+| Datei | Inhalt |
 |---|---|
-| Ist das legal? | Ja. Handel mit ausschließlich eigenem Geld auf eigene Rechnung ist keine erlaubnispflichtige Kryptowerte-Dienstleistung (BaFin-Merkblatt zu MiCAR, 03.01.2025). Bedingungen: nur eigenes Kapital, keine Dienste für Dritte, keine manipulativen Ordermuster (Art. 91 MiCA). Abschnitt 2 |
-| Welches Konto? | Privatkonto bei Bitvavo (MiCA-Lizenz, 0,15 % Maker / 0,25 % Taker, SEPA kostenlos, REST + WebSocket, ccxt). API-Key nur mit View + Trade, nie Withdraw. Kraken Pro optional als Zweitkonto. Abschnitt 4 |
-| Kann Claude handeln? | Nicht als Live-Entscheider. Ein deterministischer Bot (Freqtrade) setzt Orders und erzwingt Risikogrenzen. Claude entwirft Strategie und Code, analysiert Backtests, reviewt Logs und liefert optional ein langsames Regime-Signal als Gate. Abschnitt 5 |
-| Wie umsetzen? | Backtest, dann mindestens 3 Monate Dry-Run, dann 200 bis 500 EUR live, dann skalieren, jeweils mit Go/No-Go-Kriterium. Abschnitt 7, 8, 11 |
+| [docs/PROJEKTPLAN.md](docs/PROJEKTPLAN.md) | Recherche und Plan: Rechtslage, Steuern, Börsenvergleich, Strategie, Architektur, Risiken, Phasen |
+| [docs/KOMPONENTEN.md](docs/KOMPONENTEN.md) | Verbindlicher Vertrag: Pfade, Umgebungsvariablen, DB-Schema, Schnittstellen, Nachträge |
+| [docs/SETUP.md](docs/SETUP.md) | Schritt für Schritt: Host, Container, Bitvavo-Keys, Env-Dateien, Tailscale, vLLM, Dry-Run |
+| [docs/BETRIEB.md](docs/BETRIEB.md) | Runbook: Kontrollen, Alarme, Kill-Switch zurücksetzen, Updates, Steuerreport, Restore |
+| [docs/BACKTEST.md](docs/BACKTEST.md) | Backtest 2019 bis 2026 mit Lookahead- und Recursive-Analyse |
+| [docs/VLLM_ADVISOR.md](docs/VLLM_ADVISOR.md) | Modellwahl nach VRAM, vLLM-Start, Schattenmodus, Auswertung |
 
-## Ehrliche Erwartung
+## Aufbau
 
-Round-Trip-Kosten von 0,30 bis 0,50 % liegen über der typischen Bewegung von Minuten- und Stundenkerzen. Kurzfristiger Handel ist mit Retail-Gebühren strukturell verlustbringend. Realistisches Ziel ist eine Rendite in der Nähe von Buy-and-Hold mit geringerem Drawdown, gemessen gegen Buy-and-Hold und DCA. Jeder Verkauf innerhalb eines Jahres ist steuerpflichtig (§ 23 EStG, Freigrenze 1.000 EUR). Abschnitt 3 und 6.
+```
+user_data/            Freqtrade: config.json, config-private.example.json, Strategien BtcTrend / BtcAdvisorGated
+btctrader/common/     Settings, Freqtrade-REST-Client, Bitvavo-Public-API, Alarme (Telegram, ntfy), SQLite, JSONL
+btctrader/ledger/     Fills, SHA-256-Kette, FIFO je Wallet, § 23-EStG-Regel, Benchmarks (B&H, DCA), Exporte, Steuerreport
+btctrader/guard/      Tagesverlustlimit, Drawdown-Kill-Switch, Bilanzabgleich, Heartbeat
+btctrader/advisor/    Marktkontext, strukturierte Regime-Entscheidung von einem lokalen vLLM-Modell, Schattenmodus
+btctrader/dashboard/  FastAPI-Seite: Equity gegen B&H und DCA, Drawdown, Gebühren, Steuer-Panel, Bot-Status
+deploy/proxmox/       create-lxc.sh, Firewall-Vorlage, NUT-Anleitung
+deploy/container/     install.sh, sync-config.sh, systemd-Units und Timer, Env-Vorlagen
+deploy/vllm/          Docker-Compose für den GPU-Host
+scripts/              download-data.sh, backtest.sh
+tests/                pytest je Komponente plus Integrationstest
+```
 
-## Geplanter Stack
+## Kern-Ergebnisse
 
-- Unprivilegierter Debian-13-LXC auf Proxmox, ohne Docker
-- Freqtrade (Dry-Run, Backtesting, FreqUI, Telegram, REST-API) mit Strategie `BtcTrend` (Trendfilter auf Tageskerzen plus Volatilitäts-Targeting)
-- Eigenes Handelsprotokoll (`ledger.py`) mit FIFO-Lots und § 23-Auswertung für die Steuer
-- `guard.py` für Tagesverlustlimit, Kill-Switch und Bilanzabgleich
-- Tailscale für den Zugriff, Healthchecks/Uptime Kuma als Dead-Man's-Switch, USV am Host
+| Backtest 04.10.2019 bis 14.09.2026, 1.000 EUR | BtcTrend (Maker 0,15 %) | Buy-and-Hold |
+|---|---|---|
+| Endkapital | 3.596 EUR | ca. 9.070 EUR |
+| CAGR | 20,2 % | 37,4 % |
+| Max. Drawdown (tägliche Bilanz) | 40,1 % | 73,6 % |
+| Trades | 13 | 1 |
 
-## Nächste Schritte
+Die Strategie schlägt Buy-and-Hold nicht. Sie halbiert den Drawdown und ist rund 55 % der Zeit investiert. Jeder Verkauf innerhalb eines Jahres ist steuerpflichtig (§ 23 EStG, Freigrenze 1.000 EUR). Details und Einordnung in `docs/BACKTEST.md`.
 
-1. Offene Entscheidungen in Abschnitt 12 des Projektplans beantworten (Börse, Zielkapital, statische IP, Proxmox-Version, USV, Advisor ja/nein).
-2. Bitvavo-Konto eröffnen, 2FA, View-only-API-Key für den Dry-Run.
-3. LXC anlegen, Freqtrade installieren, Kraken-Historie laden, erste Strategie und Backtest.
+## Entwicklung
 
-Kein Secret gehört ins Repo. API-Keys liegen nur in `/etc/freqtrade/secrets.env` (0600) auf dem Container.
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+.venv/bin/ruff check .
+.venv/bin/python -m pytest -q                 # 426 Tests, ohne Freqtrade
+# Strategie-Tests und Backtest brauchen Freqtrade 2026.8 in einem zweiten venv:
+python3 -m venv ~/ft-venv && ~/ft-venv/bin/pip install "freqtrade==2026.8" pytest
+~/ft-venv/bin/python -m pytest tests/strategy -q
+FT_BIN=~/ft-venv/bin/freqtrade scripts/download-data.sh
+FT_BIN=~/ft-venv/bin/freqtrade scripts/backtest.sh
+```
+
+## Sicherheitsregeln
+
+- Kein Secret im Repo. Keys liegen nur in `/etc/freqtrade/*.env` und `config-private.json` auf dem Container.
+- API-Keys ohne Withdraw-Recht, mit IP-Whitelist. Trade-Key erst in Phase 4.
+- FreqUI und Dashboard nur über Tailscale, kein Port-Forward.
+- Der Advisor hat keine Börsen-Keys und setzt keine Orders. Risikogrenzen stehen im Code, nicht im Prompt.

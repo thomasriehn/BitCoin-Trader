@@ -12,10 +12,13 @@ from btctrader.common.bitvavo_public import (
     BASE_URL,
     BitvavoError,
     Candle,
+    closed_only,
     fetch_book_top,
     fetch_candles,
     fetch_market_info,
     fetch_ticker_price,
+    interval_end_ms,
+    is_closed,
     parse_candles,
 )
 
@@ -117,3 +120,35 @@ def test_transport_error_raises() -> None:
     respx.get(f"{BASE_URL}/ticker/book").mock(side_effect=httpx.ReadTimeout("slow"))
     with pytest.raises(BitvavoError):
         fetch_book_top()
+
+
+DAY_MS = 86_400_000
+
+
+def test_is_closed_and_interval_end() -> None:
+    candles = parse_candles(RAW_CANDLES)
+    newest = candles[-1]  # 2026-09-15 00:00 UTC, still open during 2026-09-15
+    during_day = newest.ts_ms + 22 * 3_600_000
+    assert not is_closed(newest, "1d", during_day)
+    assert is_closed(candles[-2], "1d", during_day)
+    assert is_closed(newest, "1d", newest.ts_ms + DAY_MS)
+    assert closed_only(candles, "1d", during_day) == candles[:-1]
+    assert closed_only(candles, "1d", newest.ts_ms + DAY_MS) == candles
+    assert interval_end_ms(newest.ts_ms, "4h") == newest.ts_ms + 4 * 3_600_000
+    assert interval_end_ms(newest.ts_ms, "1W") == newest.ts_ms + 7 * DAY_MS
+    sept_1 = 1788220800000  # 2026-09-01T00:00:00Z
+    assert interval_end_ms(sept_1, "1M") == 1790812800000  # 2026-10-01T00:00:00Z
+    dec_1 = 1796083200000  # 2026-12-01T00:00:00Z
+    assert interval_end_ms(dec_1, "1M") == 1798761600000  # 2027-01-01T00:00:00Z
+    with pytest.raises(ValueError):
+        interval_end_ms(0, "3d")
+
+
+@respx.mock
+def test_fetch_candles_drop_incomplete_removes_open_candle(monkeypatch: pytest.MonkeyPatch) -> None:
+    import btctrader.common.bitvavo_public as mod
+
+    respx.get(f"{BASE_URL}/BTC-EUR/candles").mock(return_value=httpx.Response(200, json=RAW_CANDLES))
+    monkeypatch.setattr(mod.time, "time", lambda: (1789430400000 + 12 * 3_600_000) / 1000)
+    assert [c.ts_ms for c in fetch_candles(drop_incomplete=True)] == [1789257600000, 1789344000000]
+    assert len(fetch_candles()) == 3  # default keeps the open candle (documented)

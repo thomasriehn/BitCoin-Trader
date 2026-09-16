@@ -94,7 +94,7 @@ def test_tax_report_rows_and_summary(ledger_conn: sqlite3.Connection, tmp_path: 
         rows = list(csv.reader(fh, delimiter=";"))
     first = dict(zip(REPORT_COLUMNS, rows[1], strict=True))
     assert first["Kürzel"] == "BTC" and first["Menge"] == "0,01000000"
-    assert first["Anschaffungszeitpunkt"] == "2025-01-15T12:00:00Z"
+    assert first["Anschaffungszeitpunkt"] == "2025-01-15T12:00:00.000000Z"
     assert first["Anschaffungskosten inkl. Gebühren"] == "501,25"
     assert first["Plattform"] == "Bitvavo"
     assert first["Erlös"] == "800,00" and first["Verkaufsgebühr"] == "2,00"

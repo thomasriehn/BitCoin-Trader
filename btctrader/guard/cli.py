@@ -6,22 +6,37 @@ it collects observations (Freqtrade API, optional ccxt balance, lock file,
 (Freqtrade ``stopentry``/``forceexit``, lock file, alerts, ``events.jsonl``,
 optional ``cancelOrdersAfter``).
 
-Files in ``GUARD_DIR``: ``state.json``, ``killswitch.lock``, ``events.jsonl``.
+Files in ``GUARD_DIR``: ``state.json``, ``killswitch.lock``, ``events.jsonl`` and
+``.run.lock`` (an ``flock`` that serialises ``check`` and ``reset`` runs).
 
 Addition to the contract: the optional dead man's switch (``GUARD_COD_ENABLED``)
 needs a key with trade permission. It is read from ``GUARD_TRADE_API_KEY`` and
-``GUARD_TRADE_API_SECRET`` (environment or the btctrader env file), never from
-the read-only key.
+``GUARD_TRADE_API_SECRET``, never from the read-only key. Because
+``btctrader.env`` is the ``EnvironmentFile`` of every service (dashboard,
+advisor, ledger, both Freqtrade bots), a trade key must not live there: put it
+in a dedicated file (``GUARD_TRADE_ENV_FILE``, default
+``/etc/freqtrade/secrets-guard.env``, root:freqtrade 0640) that only the guard
+reads. Precedence: process environment, then the dedicated file, then (with a
+warning) ``btctrader.env``.
+
+Equity plausibility: Freqtrade values the BTC wallet with its ticker cache and
+reports ``est_stake`` 0 when the ticker is missing or the exchange call failed,
+which would look like a crash and trip the kill switch. When BTC is held but not
+valued, the guard values it with the public Bitvavo ticker instead; if that fails
+too, the run counts as "Freqtrade unavailable" and no limit is evaluated.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -52,10 +67,16 @@ log = logging.getLogger("btctrader.guard")
 STATE_FILE = "state.json"
 LOCK_FILE = "killswitch.lock"
 EVENTS_FILE = "events.jsonl"
+RUN_LOCK_FILE = ".run.lock"
 DECISION_FILE = "decision.json"
 
 TRADE_KEY_VAR = "GUARD_TRADE_API_KEY"
 TRADE_SECRET_VAR = "GUARD_TRADE_API_SECRET"
+TRADE_ENV_FILE_VAR = "GUARD_TRADE_ENV_FILE"
+DEFAULT_TRADE_ENV_FILE = Path("/etc/freqtrade/secrets-guard.env")
+
+ACTION_FAILED_ALERT_PREFIX = "action_failed:"
+"""``last_alerts`` key prefix for rate-limited alerts about failed actions (per action kind)."""
 
 COD_MIN_SECONDS = 10
 COD_MAX_SECONDS = 300
@@ -105,23 +126,49 @@ def make_exchange(api_key: str, api_secret: str, operator_id: int) -> Any:
     )
 
 
+def _trade_key_from_file(path: Path) -> tuple[str, str]:
+    if not path.is_file():
+        return "", ""
+    try:
+        values = parse_env_file(path)
+    except OSError as exc:
+        log.warning("cannot read env file %s: %s", path, exc)
+        return "", ""
+    return values.get(TRADE_KEY_VAR, "").strip(), values.get(TRADE_SECRET_VAR, "").strip()
+
+
 def trade_key_from_env(env: Mapping[str, str] | None = None) -> tuple[str, str]:
-    """Read ``GUARD_TRADE_API_KEY``/``GUARD_TRADE_API_SECRET`` from the environment or the env file.
+    """Read ``GUARD_TRADE_API_KEY``/``GUARD_TRADE_API_SECRET``.
 
     ``load_settings`` only knows the contract variables, so this addition is read here.
-    Environment variables win over the env file.
+    Precedence: process environment, then the dedicated guard secrets file
+    (``GUARD_TRADE_ENV_FILE``, default ``/etc/freqtrade/secrets-guard.env``), then the
+    shared btctrader env file as a fallback with a warning (that file reaches every
+    service's environment, a trade key does not belong there).
     """
     base: Mapping[str, str] = os.environ if env is None else env
-    merged: dict[str, str] = {}
+    key, secret = base.get(TRADE_KEY_VAR, "").strip(), base.get(TRADE_SECRET_VAR, "").strip()
+    if key and secret:
+        return key, secret
+
+    dedicated = base.get(TRADE_ENV_FILE_VAR, "").strip()
+    file_key, file_secret = _trade_key_from_file(Path(dedicated) if dedicated else DEFAULT_TRADE_ENV_FILE)
+    key, secret = key or file_key, secret or file_secret
+    if key and secret:
+        return key, secret
+
     env_file = base.get(ENV_FILE_VAR, "").strip()
-    candidate = Path(env_file) if env_file else DEFAULT_ENV_FILE
-    if candidate.is_file():
-        try:
-            merged.update(parse_env_file(candidate))
-        except OSError as exc:
-            log.warning("cannot read env file %s: %s", candidate, exc)
-    merged.update({k: v for k, v in base.items() if k in (TRADE_KEY_VAR, TRADE_SECRET_VAR)})
-    return merged.get(TRADE_KEY_VAR, "").strip(), merged.get(TRADE_SECRET_VAR, "").strip()
+    shared = Path(env_file) if env_file else DEFAULT_ENV_FILE
+    file_key, file_secret = _trade_key_from_file(shared)
+    if file_key or file_secret:
+        log.warning(
+            "trade key read from %s: move %s/%s to %s, the shared env file is loaded by every service",
+            shared,
+            TRADE_KEY_VAR,
+            TRADE_SECRET_VAR,
+            DEFAULT_TRADE_ENV_FILE,
+        )
+    return key or file_key, secret or file_secret
 
 
 # -- files ---------------------------------------------------------------------------
@@ -151,6 +198,20 @@ def write_event(guard_dir: Path, name: str, details: dict[str, Any], now: dateti
     append_jsonl(events_path(guard_dir), {"ts": iso_utc(now), "event": name, "details": details})
 
 
+@contextmanager
+def run_lock(guard_dir: Path) -> Iterator[None]:
+    """Exclusive ``flock`` on ``GUARD_DIR/.run.lock`` so a minutely ``check`` and a manual
+    ``reset`` never interleave (read state, unlink lock, save stale state). Blocking: a
+    ``check`` holds it for a few seconds at most."""
+    guard_dir.mkdir(parents=True, exist_ok=True)
+    with open(guard_dir / RUN_LOCK_FILE, "a+b") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 # -- observations --------------------------------------------------------------------
 
 
@@ -165,7 +226,11 @@ def _dec(value: Any) -> Decimal | None:
 
 
 def balances_from_ft(balance: dict[str, Any]) -> tuple[Decimal, Decimal, Decimal | None]:
-    """(EUR, BTC, BTC price) from ``/balance``: ``currencies[].balance`` and ``est_stake``."""
+    """(EUR, BTC, BTC price) from ``/balance``: ``currencies[].balance`` and ``est_stake``.
+
+    The price is None when BTC is not held or Freqtrade could not value it
+    (``est_stake`` 0 or missing: ticker unavailable). A price of 0 is never returned.
+    """
     eur = Decimal(0)
     btc = Decimal(0)
     price: Decimal | None = None
@@ -179,9 +244,15 @@ def balances_from_ft(balance: dict[str, Any]) -> tuple[Decimal, Decimal, Decimal
         elif currency == "BTC":
             btc += amount
             est = _dec(entry.get("est_stake"))
-            if est is not None and amount > 0:
+            if est is not None and est > 0 and amount > 0:
                 price = est / amount
     return eur, btc, price
+
+
+def bot_state_from_config(config: dict[str, Any]) -> str | None:
+    """``show_config.state`` (``running`` / ``paused`` / ``stopped``) lower-cased, None when absent."""
+    raw = config.get("state")
+    return raw.strip().lower() or None if isinstance(raw, str) else None
 
 
 def advisor_created_at(advisor_dir: Path) -> datetime | None:
@@ -231,11 +302,42 @@ def collect_observations(
             advisor_created_at=created_at,
         )
     ft_eur, ft_btc, price = balances_from_ft(balance)
+    fetch = price_fetcher or bitvavo_public.fetch_ticker_price
+
+    if ft_btc > 0 and price is None:
+        # Freqtrade holds BTC but valued it at 0 (ticker missing or exchange error in
+        # its rate lookup). Taking ``total`` at face value would look like a crash and
+        # trip the kill switch. Value the BTC with the public ticker instead.
+        try:
+            price = fetch()
+        except Exception as exc:  # noqa: BLE001 - any ticker failure means: no valid equity
+            log.warning("BTC balance without est_stake in /balance and no ticker price: %s", exc)
+            return Observations(
+                now=now,
+                ft_ok=False,
+                ft_error="BTC balance without est_stake in /balance (Freqtrade ticker unavailable) "
+                f"and public ticker failed: {exc}",
+                open_trades=open_trades,
+                lock_exists=lock_exists,
+                advisor_created_at=created_at,
+            )
+        corrected = equity + ft_btc * price
+        log.warning(
+            "BTC %s without est_stake in /balance; equity corrected from %s to %s with ticker %s",
+            ft_btc,
+            equity,
+            corrected,
+            price,
+        )
+        equity = corrected
+
     dry_run_raw = config.get("dry_run")
     dry_run = bool(dry_run_raw) if isinstance(dry_run_raw, bool) else None
+    bot_state = bot_state_from_config(config)
 
     exchange_eur: Decimal | None = None
     exchange_btc: Decimal | None = None
+    exchange_error = ""
     has_ro_key = bool(settings.bitvavo_api_key_ro and settings.bitvavo_api_secret_ro)
     if dry_run is False and has_ro_key:
         try:
@@ -249,8 +351,8 @@ def collect_observations(
         except Exception as exc:  # noqa: BLE001 - reconciliation is skipped, the rest still runs
             log.warning("exchange balance failed, reconciliation skipped: %s", exc)
             exchange_eur = exchange_btc = None
+            exchange_error = f"{type(exc).__name__}: {exc}"
         if exchange_btc is not None and price is None and (ft_btc != exchange_btc):
-            fetch = price_fetcher or bitvavo_public.fetch_ticker_price
             try:
                 price = fetch()
             except Exception as exc:  # noqa: BLE001
@@ -267,12 +369,32 @@ def collect_observations(
         exchange_eur=exchange_eur,
         exchange_btc=exchange_btc,
         btc_price=price,
+        exchange_error=exchange_error,
+        bot_state=bot_state,
         lock_exists=lock_exists,
         advisor_created_at=created_at,
     )
 
 
 # -- action execution ----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FailedAction:
+    kind: str
+    reason: str | None
+    error: str
+
+
+@dataclass
+class ExecutionResult:
+    """What ``execute_actions`` did: executed kinds in order, and the failures."""
+
+    done: list[str] = field(default_factory=list)
+    failed: list[FailedAction] = field(default_factory=list)
+
+    def failed_kinds(self) -> set[str]:
+        return {f.kind for f in self.failed}
 
 
 def execute_actions(
@@ -285,13 +407,16 @@ def execute_actions(
     settings: Settings,
     cod_exchange_factory: ExchangeFactory = make_exchange,
     trade_key: tuple[str, str] | None = None,
-) -> list[str]:
-    """Execute actions in order. Failures are logged and recorded as ``action_failed`` events.
+) -> ExecutionResult:
+    """Execute actions ordered by ``guard.ACTION_PRIORITY`` (Freqtrade control and the lock
+    file before slow alert HTTP calls). One failing action never stops the rest.
 
-    Returns the list of executed action kinds (for logging and tests).
+    Failures are logged and returned; all but ``cod_renew`` failures are also written as
+    ``action_failed`` events right here (``run_check`` rate-limits the ``cod_renew`` case,
+    which would otherwise add a line per minute while the trade key is missing).
     """
-    done: list[str] = []
-    for action in actions:
+    result = ExecutionResult()
+    for action in guard.prioritize_actions(list(actions)):
         kind = action.kind
         details = action.details
         try:
@@ -306,8 +431,11 @@ def execute_actions(
                 ft.stopentry()
                 log.info("stopentry sent (%s)", details.get("reason"))
             elif kind == guard.ACTION_FORCEEXIT:
-                result = ft.forceexit(str(details.get("tradeid", "all")))
-                log.warning("forceexit sent (%s): %s", details.get("reason"), result)
+                ordertype = details.get("ordertype")
+                response = ft.forceexit(
+                    str(details.get("tradeid", "all")), ordertype=str(ordertype) if ordertype else None
+                )
+                log.warning("forceexit sent (%s, %s): %s", details.get("reason"), ordertype, response)
             elif kind == guard.ACTION_WRITE_LOCK:
                 atomic_write_json(lock_path(guard_dir), dict(details["content"]))
                 log.warning("killswitch.lock written")
@@ -316,19 +444,94 @@ def execute_actions(
             else:
                 log.error("unknown action kind %r", kind)
                 continue
-            done.append(kind)
+            result.done.append(kind)
         except Exception as exc:  # noqa: BLE001 - one failing action must not stop the rest
-            log.error("action %s failed: %s", kind, exc)
+            reason = details.get("reason")
+            error = f"{type(exc).__name__}: {exc}"
+            log.error("action %s failed (%s): %s", kind, reason, error)
+            result.failed.append(FailedAction(kind, str(reason) if reason is not None else None, error))
+            if kind == guard.ACTION_COD_RENEW:
+                continue
             try:
                 write_event(
                     guard_dir,
                     guard.EVENT_ACTION_FAILED,
-                    {"action": kind, "reason": details.get("reason"), "error": str(exc)},
+                    {"action": kind, "reason": reason, "error": error},
                     now,
                 )
             except OSError as io_exc:
                 log.error("cannot write event: %s", io_exc)
-    return done
+    return result
+
+
+def _handle_failures(
+    state: GuardState,
+    previous: GuardState,
+    result: ExecutionResult,
+    *,
+    cfg: GuardConfig,
+    alerter: Alerter,
+    guard_dir: Path,
+    now: datetime,
+) -> GuardState:
+    """Fold action failures back into the state:
+
+    * a failed ``stopentry`` must be retried next minute, so ``daily_loss_day`` is
+      restored to its previous value (the state machine would otherwise believe the
+      limit was handled for the rest of the day);
+    * failed critical actions (forceexit, stopentry, write_lock) are alerted with
+      priority urgent, rate-limited per kind;
+    * a failed ``cod_renew`` (dead man's switch not armed) gets one ``action_failed``
+      event plus a high-priority alert, rate-limited, instead of a line per minute.
+    """
+    if not result.failed:
+        return state
+    failed_kinds = result.failed_kinds()
+    if guard.ACTION_STOPENTRY in failed_kinds:
+        state = replace(state, daily_loss_day=previous.daily_loss_day)
+
+    alerts = dict(state.last_alerts)
+    for failure in result.failed:
+        key = ACTION_FAILED_ALERT_PREFIX + failure.kind
+        critical = failure.kind in guard.CRITICAL_ACTIONS
+        if not critical and failure.kind != guard.ACTION_COD_RENEW:
+            continue
+        if not guard.may_alert(state, key, now, cfg.alert_repeat_hours):
+            continue
+        alerts[key] = now
+        state = replace(state, last_alerts=alerts)
+        if failure.kind == guard.ACTION_COD_RENEW:
+            title = "Guard: Dead-Man's-Switch nicht aktiv"
+            message = (
+                f"cancelOrdersAfter konnte nicht erneuert werden: {failure.error}. "
+                "GUARD_COD_ENABLED ist gesetzt, die Börse hat aber keinen aktiven Countdown. "
+                f"Prüfe {TRADE_KEY_VAR}/{TRADE_SECRET_VAR} und GUARD_COD_SECONDS "
+                f"({COD_MIN_SECONDS}..{COD_MAX_SECONDS})."
+            )
+            priority = "high"
+            try:
+                write_event(
+                    guard_dir,
+                    guard.EVENT_ACTION_FAILED,
+                    {"action": failure.kind, "reason": failure.reason, "error": failure.error},
+                    now,
+                )
+            except OSError as io_exc:
+                log.error("cannot write event: %s", io_exc)
+        else:
+            title = f"Guard: Aktion {failure.kind} fehlgeschlagen"
+            message = (
+                f"{failure.kind} (Grund {failure.reason or '-'}) ist fehlgeschlagen: {failure.error}. "
+                "Der Guard wiederholt die Aktion beim nächsten Lauf. Prüfe Freqtrade "
+                "(Status, Login) und das Börsenkonto: Positionen sind eventuell noch offen."
+            )
+            priority = "urgent"
+        try:
+            channels = alerter.send(title, message, priority)
+            log.info("alert sent via %s: %s", ",".join(channels) or "no channel", title)
+        except Exception as exc:  # noqa: BLE001 - alerting must never break the run
+            log.error("failure alert could not be sent: %s", exc)
+    return state
 
 
 def _renew_cod(
@@ -367,55 +570,69 @@ def run_check(
     guard_dir = settings.guard_dir
     guard_dir.mkdir(parents=True, exist_ok=True)
     cfg = GuardConfig.from_settings(settings)
-    state = load_state(guard_dir)
-    obs = collect_observations(
-        settings,
-        ft,
-        now=now,
-        guard_dir=guard_dir,
-        exchange_factory=exchange_factory,
-        price_fetcher=price_fetcher,
-    )
-    new_state, actions = guard.evaluate(state, obs, cfg)
-    executed = execute_actions(
-        actions,
-        ft=ft,
-        alerter=alerter,
-        guard_dir=guard_dir,
-        now=now,
-        settings=settings,
-        cod_exchange_factory=cod_exchange_factory,
-        trade_key=trade_key,
-    )
-    save_state(guard_dir, new_state)
+    with run_lock(guard_dir):
+        state = load_state(guard_dir)
+        obs = collect_observations(
+            settings,
+            ft,
+            now=now,
+            guard_dir=guard_dir,
+            exchange_factory=exchange_factory,
+            price_fetcher=price_fetcher,
+        )
+        new_state, actions = guard.evaluate(state, obs, cfg)
+        # Persist bookkeeping (day start, peak) before the slow part: a SIGTERM from the
+        # unit timeout during an alert must not replay the whole sequence next minute.
+        save_state(guard_dir, new_state)
+        result = execute_actions(
+            actions,
+            ft=ft,
+            alerter=alerter,
+            guard_dir=guard_dir,
+            now=now,
+            settings=settings,
+            cod_exchange_factory=cod_exchange_factory,
+            trade_key=trade_key,
+        )
+        new_state = _handle_failures(
+            new_state, state, result, cfg=cfg, alerter=alerter, guard_dir=guard_dir, now=now
+        )
+        save_state(guard_dir, new_state)
     log.info(
-        "check done: equity=%s day_start=%s peak=%s dry_run=%s lock=%s actions=%s",
+        "check done: equity=%s day_start=%s peak=%s dry_run=%s bot=%s lock=%s actions=%s failed=%s",
         obs.equity,
         new_state.day_start_equity,
         new_state.peak_equity,
         obs.dry_run,
+        obs.bot_state,
         obs.lock_exists,
-        ",".join(executed) or "-",
+        ",".join(result.done) or "-",
+        ",".join(f.kind for f in result.failed) or "-",
     )
     return new_state, actions
 
 
 def run_reset(settings: Settings, *, confirm: bool, now: datetime | None = None) -> int:
-    """Remove ``killswitch.lock`` and reset the peak so the next run starts fresh."""
+    """Remove ``killswitch.lock`` and reset the peak so the next run starts fresh.
+
+    Runs under the same ``flock`` as ``check`` and saves the reset state before the lock
+    is unlinked: if the save fails, the lock stays and nothing re-triggers.
+    """
     now = now or datetime.now(UTC)
     guard_dir = settings.guard_dir
     lock = lock_path(guard_dir)
     if not confirm:
         print("Kill-Switch wird nur mit --confirm zurückgesetzt. Nichts geändert.", file=sys.stderr)
         return EXIT_USAGE
-    existed = lock.exists()
-    previous = read_json(lock) if existed else None
-    if existed:
-        lock.unlink()
-    state = guard.reset_state_after_unlock(load_state(guard_dir))
     guard_dir.mkdir(parents=True, exist_ok=True)
-    save_state(guard_dir, state)
-    write_event(guard_dir, guard.EVENT_KILLSWITCH_RESET, {"lock_existed": existed, "lock": previous}, now)
+    with run_lock(guard_dir):
+        existed = lock.exists()
+        previous = read_json(lock) if existed else None
+        state = guard.reset_state_after_unlock(load_state(guard_dir))
+        save_state(guard_dir, state)
+        if existed:
+            lock.unlink()
+        write_event(guard_dir, guard.EVENT_KILLSWITCH_RESET, {"lock_existed": existed, "lock": previous}, now)
     if existed:
         print("killswitch.lock entfernt. Der Bot bleibt pausiert, bis Du in Freqtrade /start sendest.")
     else:
@@ -487,8 +704,6 @@ def build_parser() -> argparse.ArgumentParser:
 def _settings_for(args: argparse.Namespace, require: Sequence[str]) -> Settings:
     settings = load_settings(require=require)
     if args.guard_dir is not None:
-        from dataclasses import replace
-
         settings = replace(settings, guard_dir=args.guard_dir)
     return settings
 

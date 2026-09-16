@@ -13,7 +13,7 @@ from pathlib import Path
 
 from btctrader.common import bitvavo_public
 from btctrader.common.config import ConfigError, Settings, load_settings
-from btctrader.common.db import connect
+from btctrader.common.db import connect, parse_iso
 from btctrader.common.ftapi import FreqtradeError, client_from_settings
 from btctrader.common.log import setup_logging
 from btctrader.ledger.benchmarks import load_price_series
@@ -47,6 +47,14 @@ def _parse_month(text: str) -> tuple[int, int]:
     return y, m
 
 
+def _parse_since(text: str) -> int:
+    """ISO-8601 timestamp (naive values are UTC) to epoch milliseconds."""
+    try:
+        return int(parse_iso(text).timestamp() * 1000)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected an ISO-8601 timestamp, got {text!r}") from exc
+
+
 def _previous_month(today: date) -> tuple[int, int]:
     return (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
 
@@ -64,7 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync = sub.add_parser("sync", help="Fills holen, speichern, FIFO neu aufbauen")
     p_sync.add_argument("--source", choices=("exchange", "freqtrade-db"), default=None)
     p_sync.add_argument("--ft-db", type=Path, default=None, help="Freqtrade-DB (Default: FT_DB_PATH)")
-    p_sync.add_argument("--since", default=None, help="ISO-Zeitpunkt, ab dem Börsen-Fills geholt werden")
+    p_sync.add_argument(
+        "--since",
+        type=_parse_since,
+        default=None,
+        help="ISO-Zeitpunkt (UTC, wenn ohne Zeitzone), ab dem Börsen-Fills geholt werden",
+    )
 
     p_snap = sub.add_parser("snapshot", help="Tageszeile in equity_daily schreiben")
     p_snap.add_argument("--date", type=date.fromisoformat, default=None, help="UTC-Datum (Default: heute)")
@@ -101,10 +114,7 @@ def _open_db(args: argparse.Namespace, settings: Settings) -> sqlite3.Connection
 
 
 def cmd_sync(args: argparse.Namespace, settings: Settings, conn: sqlite3.Connection) -> int:
-    since_ms = None
-    if args.since:
-        since_ms = int(datetime.fromisoformat(args.since.replace("Z", "+00:00")).timestamp() * 1000)
-    result = run_sync(conn, settings, source=args.source, ft_db_path=args.ft_db, since_ms=since_ms)
+    result = run_sync(conn, settings, source=args.source, ft_db_path=args.ft_db, since_ms=args.since)
     print(
         f"sync {result.source}: {result.fetched} Fills gelesen, {result.upsert.inserted} neu, "
         f"{result.upsert.unchanged} unverändert, {result.upsert.updated_meta} Metadaten aktualisiert, "
@@ -117,6 +127,9 @@ def cmd_sync(args: argparse.Namespace, settings: Settings, conn: sqlite3.Connect
         )
     for warning in result.warnings:
         print(f"WARNUNG: {warning}")
+    if result.fifo_error:
+        print(f"FEHLER FIFO (Lots und Veräußerungen veraltet): {result.fifo_error}", file=sys.stderr)
+        return 1
     return 0 if not result.warnings else 2
 
 
@@ -231,10 +244,21 @@ def cmd_show(args: argparse.Namespace, settings: Settings, conn: sqlite3.Connect
 
 
 def cmd_daily(args: argparse.Namespace, settings: Settings, conn: sqlite3.Connection) -> int:
-    rc_sync = cmd_sync(argparse.Namespace(source=None, ft_db=None, since=None), settings, conn)
-    rc_snap = cmd_snapshot(argparse.Namespace(date=None), settings, conn)
-    rc_exp = cmd_export(argparse.Namespace(all=False, month=None), settings, conn)
-    return max(rc_sync, rc_snap, rc_exp)
+    """sync, snapshot, export in sequence; a failing step is reported but does not skip the others."""
+    steps = (
+        ("sync", cmd_sync, argparse.Namespace(source=None, ft_db=None, since=None)),
+        ("snapshot", cmd_snapshot, argparse.Namespace(date=None)),
+        ("export", cmd_export, argparse.Namespace(all=False, month=None)),
+    )
+    rc = 0
+    for name, func, step_args in steps:
+        try:
+            rc = max(rc, func(step_args, settings, conn))
+        except HANDLED_ERRORS as exc:
+            log.error("daily %s failed: %s", name, exc)
+            print(f"Fehler ({name}): {exc}", file=sys.stderr)
+            rc = max(rc, 1)
+    return rc
 
 
 COMMANDS = {
@@ -252,6 +276,16 @@ REQUIRED: dict[str, tuple[str, ...]] = {
     "daily": ("benchmark_start",),
 }
 
+# Errors that end a command with a one-line message instead of a traceback. ccxt errors are
+# wrapped into LedgerError in sync/snapshot; sqlite3.Error covers a locked or corrupt DB.
+HANDLED_ERRORS: tuple[type[Exception], ...] = (
+    ConfigError,
+    LedgerError,
+    FreqtradeError,
+    bitvavo_public.BitvavoError,
+    sqlite3.Error,
+)
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
@@ -264,7 +298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return COMMANDS[args.command](args, settings, conn)
         finally:
             conn.close()
-    except (ConfigError, LedgerError, FreqtradeError, bitvavo_public.BitvavoError) as exc:
+    except HANDLED_ERRORS as exc:
         log.error("%s", exc)
         print(f"Fehler: {exc}", file=sys.stderr)
         return 1

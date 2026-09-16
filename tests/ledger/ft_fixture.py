@@ -103,7 +103,8 @@ CREATE TABLE orders (
 
 
 def create_ft_db(path: Path) -> Path:
-    """Two trades: one closed (buy + partial exit + final exit) and one open with a pending order."""
+    """Two trades: one closed (buy + partial exit + final exit), one open with a pending order,
+    a zero-fill cancel and a partially filled cancel (both on the open trade)."""
     conn = sqlite3.connect(path)
     conn.executescript(FT_SCHEMA)
     trades = [
@@ -212,6 +213,23 @@ def create_ft_db(path: Path) -> Path:
         (5, 2, "sell", 1, "dry_run_sell_3", "open", 50000.0, None, 0.01, 0.0, None, None, None),
         # cancelled order with zero fill must be ignored
         (6, 2, "buy", 0, "dry_run_buy_3", "canceled", 44000.0, None, 0.01, 0.0, None, None, None),
+        # partially filled entry that timed out: Freqtrade keeps it as 'canceled' with filled > 0
+        # (handle_cancel_enter, reason PARTIALLY_FILLED) and counts the filled part as bought
+        (
+            7,
+            2,
+            "buy",
+            0,
+            "dry_run_buy_4",
+            "canceled",
+            46000.0,
+            46000.0,
+            0.01,
+            0.004,
+            184.0,
+            "2026-05-02 00:05:00.000000",
+            None,
+        ),
     ]
     conn.executemany(
         "INSERT INTO orders (id, ft_trade_id, ft_order_side, ft_is_open, order_id, status, price, average, "

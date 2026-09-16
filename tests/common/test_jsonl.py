@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
 
+import btctrader.common.jsonl as jsonl_mod
 from btctrader.common.jsonl import append_jsonl, atomic_write_json, read_json, read_jsonl_tail
 
 
@@ -79,3 +82,53 @@ def test_read_json_invalid_or_missing(tmp_path: Path) -> None:
     assert read_json(p) is None
     p.write_text("[1, 2]", encoding="utf-8")
     assert read_json(p) is None
+
+
+def test_tail_reads_backwards_across_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Lines longer than the block and objects spanning block boundaries must survive.
+    monkeypatch.setattr(jsonl_mod, "TAIL_BLOCK_SIZE", 100)
+    p = tmp_path / "decisions.jsonl"
+    for i in range(40):
+        append_jsonl(p, {"i": i, "pad": "x" * (i * 13 % 250)})
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write("{broken")  # crashed writer, no newline
+    assert [o["i"] for o in read_jsonl_tail(p, 5)] == [35, 36, 37, 38, 39]
+    assert [o["i"] for o in read_jsonl_tail(p, 1)] == [39]
+    assert [o["i"] for o in read_jsonl_tail(p, 1000)] == list(range(40))
+    assert read_jsonl_tail(p, 5) == read_jsonl_tail(p, 5)  # deterministic
+
+
+def test_tail_does_not_read_whole_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = tmp_path / "big.jsonl"
+    for i in range(2000):
+        append_jsonl(p, {"i": i, "raw": "r" * 200})
+    reads: list[int] = []
+    real_open = Path.open
+
+    def counting_open(self: Path, *args: object, **kwargs: object) -> object:
+        fh = real_open(self, *args, **kwargs)  # type: ignore[arg-type]
+        real_read = fh.read
+
+        def read(n: int = -1) -> bytes:
+            reads.append(n)
+            return real_read(n)
+
+        fh.read = read  # type: ignore[method-assign]
+        return fh
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    assert [o["i"] for o in read_jsonl_tail(p, 2)] == [1998, 1999]
+    assert sum(reads) < p.stat().st_size / 4
+
+
+def test_atomic_write_honours_umask(tmp_path: Path) -> None:
+    old = os.umask(0o022)
+    try:
+        p = tmp_path / "decision.json"
+        atomic_write_json(p, {"v": 1})
+        assert stat.S_IMODE(p.stat().st_mode) == 0o644  # not mkstemp's 0600
+        os.umask(0o027)
+        atomic_write_json(p, {"v": 2})
+        assert stat.S_IMODE(p.stat().st_mode) == 0o640  # systemd UMask=0027: group readable
+    finally:
+        os.umask(old)

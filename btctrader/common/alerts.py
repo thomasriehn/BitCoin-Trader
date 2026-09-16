@@ -29,13 +29,15 @@ _NTFY_PRIORITY = {
 
 
 def _header_value(text: str) -> str:
-    """Encode a header value so non-latin-1 text survives (RFC 2047, supported by ntfy)."""
+    """Encode a header value so non-ASCII text survives (RFC 2047, supported by ntfy).
+
+    httpx sends header values as ASCII, so even latin-1 characters such as
+    German umlauts ("ausgelöst") must be encoded or the request never leaves.
+    """
     one_line = " ".join(text.split())
-    try:
-        one_line.encode("latin-1")
+    if one_line.isascii():
         return one_line
-    except UnicodeEncodeError:
-        return "=?UTF-8?B?" + base64.b64encode(one_line.encode("utf-8")).decode("ascii") + "?="
+    return "=?UTF-8?B?" + base64.b64encode(one_line.encode("utf-8")).decode("ascii") + "?="
 
 
 class Alerter:

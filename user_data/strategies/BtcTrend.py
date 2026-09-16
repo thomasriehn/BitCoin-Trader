@@ -15,11 +15,20 @@ Rules (see docs/KOMPONENTEN.md section 7):
   with realized_vol = std of daily returns over ``vol_lookback`` days * sqrt(365).
 * Rebalancing: ``adjust_trade_position`` buys or sells part of the position
   when the exposure drifts more than ``rebalance_band`` from the target and
-  the order is at least max(min_order_eur, min_order_pct * capital).
+  the order is at least max(min_order_eur, min_order_pct * capital). The
+  decision is made in EUR at the current price; a partial exit is translated
+  to Freqtrade's convention before it is returned (see ``adjust_trade_position``),
+  because Freqtrade sizes a negative stake relative to ``trade.stake_amount``
+  (the cost basis), not relative to the current position value.
+* Unknown realized volatility (no ``rvol`` value on the last candle) means no
+  new entry and no rebalance. The vol-targeting rule never falls back to 100 %.
 * Catastrophe stop at -10 % (bot side; Bitvavo has no exchange-side stop in
   Freqtrade). ROI is effectively disabled.
-* ``confirm_trade_entry`` refuses new entries while ``$GUARD_DIR/killswitch.lock``
-  exists (written by btctrader-guard). No network calls anywhere in this file.
+* Entries are refused while ``$GUARD_DIR/killswitch.lock`` exists (written by
+  btctrader-guard). Freqtrade only calls ``confirm_trade_entry`` for the initial
+  entry, so the same check also gates ``custom_stake_amount`` and the buy side of
+  ``adjust_trade_position``; partial exits are never blocked. A lock directory
+  that cannot be read counts as locked. No network calls anywhere in this file.
 
 Order settings for maker execution at Bitvavo (why they are what they are):
 
@@ -51,7 +60,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +76,8 @@ logger = logging.getLogger(__name__)
 PAIR = "BTC/EUR"
 DEFAULT_GUARD_DIR = "/srv/trading/guard"
 KILLSWITCH_FILENAME = "killswitch.lock"
+# Repeated refusals (kill switch, gate, min-hold veto) are logged once per interval and reason.
+WARN_INTERVAL = timedelta(hours=1)
 # Exit reasons that must never be vetoed by the minimum holding period.
 NON_VETOABLE_EXITS = frozenset(
     {
@@ -156,6 +167,7 @@ class BtcTrend(IStrategy):
     def bot_start(self, **kwargs: Any) -> None:
         self._exchange_min_order_eur: float | None = None
         self._tf_minutes = timeframe_to_minutes(self.timeframe)
+        self._last_warn: dict[str, datetime] = {}
 
     # ------------------------------------------------------------------ indicators
 
@@ -204,7 +216,16 @@ class BtcTrend(IStrategy):
         # With stake_amount "unlimited" and max_open_trades 1 the proposed stake is the
         # tradable capital (free EUR * tradable_balance_ratio); no position is open here.
         capital = proposed_stake
+        blocked = self.entry_block_reason()
+        if blocked is not None:
+            self._warn_rate_limited("entry", current_time, f"{pair}: entry refused, {blocked}")
+            return 0.0
         exposure = self.target_exposure(pair)
+        if exposure is None:
+            self._warn_rate_limited(
+                "rvol", current_time, f"{pair}: realized volatility unknown, no entry (no fallback to 100 %)"
+            )
+            return 0.0
         stake = capital * exposure
         if stake < lib.min_order_value(
             capital, self.exchange_min_order_eur(), float(self.min_order_pct.value)
@@ -251,6 +272,11 @@ class BtcTrend(IStrategy):
         position_value = trade.amount * current_rate
         capital = self.free_stake() + position_value
         target = self.target_exposure(trade.pair)
+        if target is None:
+            self._warn_rate_limited(
+                "rvol", current_time, f"{trade.pair}: realized volatility unknown, no rebalance"
+            )
+            return None
         min_order = lib.min_order_value(
             capital, self.exchange_min_order_eur(), float(self.min_order_pct.value)
         )
@@ -262,6 +288,12 @@ class BtcTrend(IStrategy):
         if order_value is None:
             return None
         if order_value > 0:
+            blocked = self.entry_block_reason()
+            if blocked is not None:
+                self._warn_rate_limited(
+                    "entry", current_time, f"{trade.pair}: rebalance buy refused, {blocked}"
+                )
+                return None
             order_value = min(order_value, max_stake)
             if order_value < min_order:
                 return None
@@ -273,18 +305,26 @@ class BtcTrend(IStrategy):
                 target,
             )
             return order_value, "rebalance_up"
-        # Partial exit: never leave a dust position behind that is below the minimum.
+        # Partial exit. Never leave a dust position behind that Freqtrade could not sell:
+        # it checks the remainder against the minimum stake including the stoploss reserve
+        # (exchange._get_stake_amount_limit), which is larger than the min_stake passed here.
         remaining = position_value + order_value
-        if min_stake is not None and 0 < remaining < min_stake:
+        if min_stake is not None and 0 < remaining < lib.exit_min_stake(min_stake, self.stoploss):
             order_value = -position_value
+        sell_fraction = min(1.0, -order_value / position_value) if position_value > 0 else 1.0
         logger.log(
             self._log_level(),
-            "%s: rebalance sell %.2f EUR (target exposure %.2f)",
+            "%s: rebalance sell %.2f EUR = %.1f %% of the position (target exposure %.2f)",
             trade.pair,
             -order_value,
+            sell_fraction * 100.0,
             target,
         )
-        return order_value, "rebalance_down"
+        # Freqtrade turns a negative stake into base amount = |stake| * trade.amount / trade.stake_amount,
+        # i.e. relative to the cost basis. Return the same fraction of trade.stake_amount so that
+        # exactly sell_fraction * trade.amount is sold whatever the current price is. A full flatten
+        # (fraction 1) leaves a remainder of 0, which Freqtrade treats as closing the trade.
+        return lib.partial_exit_stake(sell_fraction, float(trade.stake_amount)), "rebalance_down"
 
     # ------------------------------------------------------------------ exits
 
@@ -317,12 +357,12 @@ class BtcTrend(IStrategy):
             return True
         held = lib.candles_held(trade.open_date_utc, current_time, self._timeframe_minutes())
         if held < int(self.min_hold_candles.value):
-            logger.info(
-                "%s: exit '%s' vetoed, held %d < %d candles",
-                pair,
-                exit_reason,
-                held,
-                int(self.min_hold_candles.value),
+            self._warn_rate_limited(
+                "min_hold",
+                current_time,
+                f"{pair}: exit '{exit_reason}' vetoed, held {held} < {int(self.min_hold_candles.value)} "
+                "candles",
+                level=logging.INFO,
             )
             return False
         return True
@@ -345,15 +385,25 @@ class BtcTrend(IStrategy):
         if order_value < self.exchange_min_order_eur():
             logger.warning("%s: entry of %.2f EUR below exchange minimum, refused", pair, order_value)
             return False
-        if self.killswitch_active():
-            logger.warning("%s: entry refused, %s exists", pair, self.killswitch_path())
+        blocked = self.entry_block_reason()
+        if blocked is not None:
+            self._warn_rate_limited("entry", current_time, f"{pair}: entry refused, {blocked}")
             return False
         return True
 
+    def entry_block_reason(self) -> str | None:
+        """Why new exposure (initial entry or rebalance buy) is refused right now; None when allowed.
+
+        Subclasses extend this (BtcAdvisorGated adds the advisor gate). Exits never consult it.
+        """
+        if self.killswitch_active():
+            return f"{self.killswitch_path()} exists"
+        return None
+
     # ------------------------------------------------------------------ helpers
 
-    def target_exposure(self, pair: str) -> float:
-        """Exposure from the last analysed candle's realized volatility (fallback 1.0)."""
+    def target_exposure(self, pair: str) -> float | None:
+        """Exposure min(1, target_vol / rvol) from the last analysed candle; None when rvol is unknown."""
         rvol: float | None = None
         try:
             dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
@@ -361,6 +411,8 @@ class BtcTrend(IStrategy):
                 rvol = lib.last_finite(dataframe["rvol"])
         except Exception as exc:  # noqa: BLE001 - never break order flow on a data hiccup
             logger.warning("%s: could not read analysed dataframe: %s", pair, exc)
+        if rvol is None:
+            return None
         return lib.exposure_from_vol(float(self.target_vol.value), rvol)
 
     def free_stake(self) -> float:
@@ -389,13 +441,43 @@ class BtcTrend(IStrategy):
         return Path(os.environ.get("GUARD_DIR", DEFAULT_GUARD_DIR)) / KILLSWITCH_FILENAME
 
     def killswitch_active(self) -> bool:
-        """True when the guard's lock file exists. Only consulted in live and dry-run mode."""
+        """True when the guard's lock file exists. Only consulted in live and dry-run mode.
+
+        ``Path.exists`` returns False for a missing file or directory but raises for
+        EACCES/EPERM. A lock we are not allowed to see counts as active (fail closed);
+        any other OS error is logged and counts as inactive.
+        """
         if not self._is_live_or_dry():
             return False
+        path = self.killswitch_path()
         try:
-            return self.killswitch_path().exists()
-        except OSError:
+            return path.exists()
+        except PermissionError as exc:
+            self._warn_rate_limited(
+                "killswitch_io",
+                datetime.now(UTC),
+                f"cannot read {path} ({exc}); kill switch counts as active",
+            )
+            return True
+        except OSError as exc:
+            self._warn_rate_limited(
+                "killswitch_io",
+                datetime.now(UTC),
+                f"cannot read {path} ({exc}); kill switch counts as inactive",
+            )
             return False
+
+    def _warn_rate_limited(self, key: str, now: datetime, message: str, level: int = logging.WARNING) -> None:
+        """Log ``message`` at most once per WARN_INTERVAL per ``key`` (Freqtrade loops every 5 s)."""
+        last_warn = getattr(self, "_last_warn", None)
+        if last_warn is None:
+            last_warn = self._last_warn = {}
+        last = last_warn.get(key)
+        if last is not None and now - last < WARN_INTERVAL:
+            logger.debug(message)
+            return
+        last_warn[key] = now
+        logger.log(level, message)
 
     def _log_level(self) -> int:
         """INFO in live/dry-run (one line per decision), DEBUG in backtesting to keep output readable."""

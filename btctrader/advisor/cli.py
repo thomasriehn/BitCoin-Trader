@@ -14,7 +14,7 @@ from btctrader.advisor import advisor
 from btctrader.advisor import context as ctx_mod
 from btctrader.advisor import evaluate as ev_mod
 from btctrader.common.config import ConfigError, Settings, load_settings
-from btctrader.common.ftapi import FreqtradeClient, client_from_settings
+from btctrader.common.ftapi import client_from_settings
 from btctrader.common.jsonl import read_json
 from btctrader.common.log import setup_logging
 
@@ -45,10 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _freqtrade_client(settings: Settings, disabled: bool) -> FreqtradeClient | None:
+def _status_fn(settings: Settings, disabled: bool) -> ctx_mod.StatusFn | None:
+    """Only the read-only ``status`` method of the Freqtrade client leaves this function (section 6)."""
     if disabled or not (settings.ft_api_user and settings.ft_api_pass):
         return None
-    return client_from_settings(settings)
+    return client_from_settings(settings).status
 
 
 def _load_context_file(path: Path) -> dict[str, Any]:
@@ -63,9 +64,8 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
     if args.context_file is not None:
         context = _load_context_file(args.context_file)
     if args.dry_run:
-        ft = _freqtrade_client(settings, args.no_bot)
         if context is None:
-            context = ctx_mod.build_context(ft=ft)
+            context = ctx_mod.build_context(status=_status_fn(settings, args.no_bot))
         request = advisor.build_request(settings.advisor_model, advisor.load_system_prompt(), context)
         headers = {"Authorization": "Bearer ***" if settings.advisor_api_key else "(none)"}
         print(
@@ -82,14 +82,12 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
             )
         )
         return 0
-    ft = _freqtrade_client(settings, args.no_bot)
-    outcome = advisor.run_advisor(settings, context=context, ft_client=ft)
+    outcome = advisor.run_advisor(settings, context=context, status_fn=_status_fn(settings, args.no_bot))
     return outcome.exit_code
 
 
 def cmd_context(args: argparse.Namespace, settings: Settings) -> int:
-    ft = _freqtrade_client(settings, args.no_bot)
-    context = ctx_mod.build_context(ft=ft)
+    context = ctx_mod.build_context(status=_status_fn(settings, args.no_bot))
     text = json.dumps(context, indent=2, sort_keys=True, ensure_ascii=False)
     print(text)
     if args.out is not None:

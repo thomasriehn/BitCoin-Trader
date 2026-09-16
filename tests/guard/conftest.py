@@ -30,6 +30,9 @@ class FakeFT:
         price: str = "50000",
         unreachable: bool = False,
         last_process_age_s: float = 5.0,
+        bot_state: str | None = "running",
+        est_stake_missing: bool = False,
+        open_trades: int | None = None,
     ) -> None:
         self.equity = Decimal(equity)
         self.dry_run = dry_run
@@ -38,6 +41,13 @@ class FakeFT:
         self.eur = Decimal(eur) if eur is not None else self.equity - self.btc * self.price
         self.unreachable = unreachable
         self.last_process_age_s = last_process_age_s
+        self.bot_state = bot_state
+        self.est_stake_missing = est_stake_missing
+        """Simulate Freqtrade valuing the BTC wallet at 0 (ticker unavailable): est_stake 0, total = EUR."""
+        self.open_trades = open_trades
+        """Number of open trades reported by /status; None = 1 when BTC is held, else 0."""
+        self.fail: set[str] = set()
+        """Control calls (``stopentry``, ``forceexit``) that raise ``FreqtradeError``."""
         self.calls: list[str] = []
         self.now = T0
 
@@ -56,31 +66,40 @@ class FakeFT:
             {"currency": "EUR", "free": float(self.eur), "balance": float(self.eur), "used": 0.0,
              "est_stake": float(self.eur), "stake": "EUR", "side": "long", "is_position": False},
         ]
+        est_btc = 0.0 if self.est_stake_missing else float(self.btc * self.price)
         if self.btc:
             currencies.append(
                 {"currency": "BTC", "free": float(self.btc), "balance": float(self.btc), "used": 0.0,
-                 "est_stake": float(self.btc * self.price), "stake": "EUR", "side": "long",
-                 "is_position": False}
+                 "est_stake": est_btc, "stake": "EUR", "side": "long", "is_position": False}
             )
-        return {"currencies": currencies, "total": float(self.equity), "stake": "EUR", "value": 0.0}
+        total = float(self.eur) + est_btc if self.est_stake_missing else float(self.equity)
+        return {"currencies": currencies, "total": total, "stake": "EUR", "value": 0.0}
 
     def status(self) -> list[dict[str, Any]]:
         self._guard()
-        return [{"trade_id": 1}] if self.btc else []
+        n = self.open_trades if self.open_trades is not None else (1 if self.btc else 0)
+        return [{"trade_id": i + 1} for i in range(n)]
 
     def show_config(self) -> dict[str, Any]:
         self._guard()
-        return {"dry_run": self.dry_run, "version": "2026.8"}
+        config: dict[str, Any] = {"dry_run": self.dry_run, "version": "2026.8"}
+        if self.bot_state is not None:
+            config["state"] = self.bot_state
+        return config
 
     def stopentry(self) -> dict[str, Any]:
         self._guard()
+        if "stopentry" in self.fail:
+            raise FreqtradeError("POST /stopentry: 500 Internal Server Error", status_code=500)
         self.calls.append("stopentry")
         return {"status": "No more entries will occur from now. Run /start to enable entries."}
 
     def forceexit(self, tradeid: str = "all", ordertype: str | None = None) -> dict[str, Any]:
         self._guard()
-        self.calls.append(f"forceexit:{tradeid}")
-        return {"result": "Created exit order for trade all."}
+        if "forceexit" in self.fail:
+            raise FreqtradeError("POST /forceexit: 502 Bad Gateway", status_code=502)
+        self.calls.append(f"forceexit:{tradeid}:{ordertype}")
+        return {"result": "Created exit orders for all open trades."}
 
 
 class RecordingAlerter(Alerter):

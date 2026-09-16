@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 
 import httpx
@@ -62,6 +63,25 @@ def test_non_latin1_title_is_encoded_for_ntfy() -> None:
     route = respx.post(NTFY).mock(return_value=httpx.Response(200, json={}))
     assert Alerter(ntfy_url=NTFY).send("Achtung €", "m") == ["ntfy"]
     assert route.calls[0].request.headers["Title"].startswith("=?UTF-8?B?")
+
+
+@respx.mock
+def test_umlaut_title_reaches_ntfy() -> None:
+    # httpx encodes header values as ASCII: a latin-1 umlaut must be RFC-2047 encoded too,
+    # otherwise the guard's kill-switch alarm ("Guard: KILL-SWITCH ausgelöst") is never sent.
+    route = respx.post(NTFY).mock(return_value=httpx.Response(200, json={}))
+    assert Alerter(ntfy_url=NTFY).send("Guard: KILL-SWITCH ausgelöst", "Drawdown 21 %") == ["ntfy"]
+    title = route.calls[0].request.headers["Title"]
+    assert title.startswith("=?UTF-8?B?") and title.endswith("?=")
+    assert base64.b64decode(title[len("=?UTF-8?B?") : -2]).decode("utf-8") == "Guard: KILL-SWITCH ausgelöst"
+    assert route.calls[0].request.content.decode("utf-8") == "Drawdown 21 %"
+
+
+@respx.mock
+def test_ascii_title_is_sent_verbatim() -> None:
+    route = respx.post(NTFY).mock(return_value=httpx.Response(200, json={}))
+    assert Alerter(ntfy_url=NTFY).send("Guard: daily loss", "m") == ["ntfy"]
+    assert route.calls[0].request.headers["Title"] == "Guard: daily loss"
 
 
 def test_alerter_from_settings() -> None:

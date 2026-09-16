@@ -78,14 +78,24 @@ def analyse(strategy, df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def fake_trade(amount: float, opened: datetime, last_fill: datetime | None = None) -> SimpleNamespace:
+def fake_trade(
+    amount: float, opened: datetime, last_fill: datetime | None = None, open_rate: float = 30_000.0
+) -> SimpleNamespace:
+    """Minimal stand-in for freqtrade.persistence.Trade (spot: stake_amount = amount * open_rate)."""
     return SimpleNamespace(
         pair=PAIR,
         amount=amount,
+        open_rate=open_rate,
+        stake_amount=amount * open_rate,
         open_date_utc=opened,
         date_last_filled_utc=last_fill or opened,
         has_open_orders=False,
     )
+
+
+def freqtrade_exit_amount(stake: float, trade: SimpleNamespace) -> float:
+    """Base amount Freqtrade 2026.8 sells for a negative adjust_trade_position result."""
+    return abs(stake) * trade.amount / trade.stake_amount
 
 
 class FakeWallets:
@@ -214,14 +224,166 @@ def test_adjust_trade_position_rebalances(strategy_dir: Path) -> None:
     amount, tag = result
     assert amount == pytest.approx(drift * 1000.0)
     assert tag == "rebalance_up"
+
+
+@pytest.mark.parametrize("open_rate_factor", [0.5, 1.0, 1.6])
+def test_adjust_trade_position_sell_is_sized_in_freqtrade_units(
+    strategy_dir: Path, open_rate_factor: float
+) -> None:
+    """The intended EUR sell value must survive Freqtrade's |stake| * amount / stake_amount conversion.
+
+    open_rate_factor < 1: the trade is in profit (cost basis below current value),
+    > 1: at a loss. The old code returned the EUR value at the current price, which
+    Freqtrade scaled by current_rate / open_rate.
+    """
+    s = load(strategy_dir)
+    df = analyse(s, make_dataframe(noise=0.04))
+    rate = float(df["close"].iloc[-1])
+    target = s.target_exposure(PAIR)
     # Heavily over-exposed: 950 EUR position, 50 EUR free -> partial exit.
     s.wallets = FakeWallets(50.0)
-    trade = fake_trade(amount=950.0 / rate, opened=opened)
+    trade = fake_trade(
+        amount=950.0 / rate, opened=NOW - timedelta(days=10), open_rate=rate * open_rate_factor
+    )
     result = s.adjust_trade_position(trade, NOW, rate, 0.0, 5.8, 50.0, rate, rate, 0.0, 0.0)
     assert result is not None
-    amount, tag = result
-    assert amount < 0 and tag == "rebalance_down"
-    assert amount == pytest.approx((target - 0.95) * 1000.0)
+    stake, tag = result
+    assert stake < 0 and tag == "rebalance_down"
+    intended_eur = (0.95 - target) * 1000.0
+    assert 0 < intended_eur < 950.0
+    sold_btc = freqtrade_exit_amount(stake, trade)
+    assert sold_btc * rate == pytest.approx(intended_eur)
+    assert sold_btc < trade.amount
+    # And the remainder is what the rule wants: target exposure at the current price.
+    assert (trade.amount - sold_btc) * rate / 1000.0 == pytest.approx(target)
+
+
+@pytest.mark.parametrize("open_rate_factor", [0.5, 1.6])
+def test_adjust_trade_position_flattens_instead_of_leaving_dust(
+    strategy_dir: Path, open_rate_factor: float
+) -> None:
+    s = load(strategy_dir)
+    df = analyse(s, make_dataframe(noise=0.04))
+    rate = float(df["close"].iloc[-1])
+    target = s.target_exposure(PAIR)
+    # Capital such that the position after the intended sell would be about 5 EUR
+    # (below min_stake with the stoploss reserve): 5 / target EUR total, all in the position.
+    capital = 5.0 / target
+    s.wallets = FakeWallets(0.0)
+    trade = fake_trade(
+        amount=capital / rate, opened=NOW - timedelta(days=10), open_rate=rate * open_rate_factor
+    )
+    min_stake = 5.8
+    result = s.adjust_trade_position(trade, NOW, rate, 0.0, min_stake, 0.0, rate, rate, 0.0, 0.0)
+    assert result is not None
+    stake, tag = result
+    assert tag == "rebalance_down"
+    # Full flatten in Freqtrade's units: the derived amount equals trade.amount exactly,
+    # whatever the entry price was, so Freqtrade's remainder check sees 0 and closes the trade.
+    assert stake == pytest.approx(-trade.stake_amount)
+    assert freqtrade_exit_amount(stake, trade) == pytest.approx(trade.amount)
+
+
+def test_adjust_trade_position_sell_never_exceeds_position(strategy_dir: Path) -> None:
+    s = load(strategy_dir)
+    df = analyse(s, make_dataframe(noise=0.04))
+    rate = float(df["close"].iloc[-1])
+    s.wallets = FakeWallets(50.0)
+    # Deep in profit: cost basis is a fifth of the current value.
+    trade = fake_trade(amount=950.0 / rate, opened=NOW - timedelta(days=10), open_rate=rate * 0.2)
+    stake, _ = s.adjust_trade_position(trade, NOW, rate, 0.0, 5.8, 50.0, rate, rate, 0.0, 0.0)
+    assert freqtrade_exit_amount(stake, trade) <= trade.amount
+
+
+def test_adjust_trade_position_buy_respects_killswitch(
+    strategy_dir: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """Freqtrade skips confirm_trade_entry for position adjustments, so the lock must be checked here."""
+    monkeypatch.setenv("GUARD_DIR", str(tmp_path))
+    s = load(strategy_dir, runmode=RunMode.DRY_RUN)
+    df = analyse(s, make_dataframe(noise=0.04))
+    rate = float(df["close"].iloc[-1])
+    opened = NOW - timedelta(days=10)
+    under = fake_trade(amount=200.0 / rate, opened=opened)
+    over = fake_trade(amount=950.0 / rate, opened=opened)
+
+    s.wallets = FakeWallets(800.0)
+    assert s.adjust_trade_position(under, NOW, rate, 0.0, 5.8, 800.0, rate, rate, 0.0, 0.0) is not None
+    (tmp_path / "killswitch.lock").write_text("2026-09-15T10:00:00Z equity=800 peak=1000\n")
+    assert s.adjust_trade_position(under, NOW, rate, 0.0, 5.8, 800.0, rate, rate, 0.0, 0.0) is None
+    # The initial entry is refused in both hooks Freqtrade offers for it.
+    assert s.custom_stake_amount(PAIR, NOW, rate, 990.0, 5.8, 990.0, 1.0, "trend_up", "long") == 0.0
+    assert s.confirm_trade_entry(PAIR, "limit", 0.01, rate, "GTC", NOW, "trend_up", "long") is False
+    # Partial exits are never blocked by the lock.
+    s.wallets = FakeWallets(50.0)
+    result = s.adjust_trade_position(over, NOW, rate, 0.0, 5.8, 50.0, rate, rate, 0.0, 0.0)
+    assert result is not None and result[0] < 0 and result[1] == "rebalance_down"
+
+
+def test_killswitch_permission_error_counts_as_active(
+    strategy_dir: Path, tmp_path: Path, monkeypatch, caplog
+) -> None:
+    s = load(strategy_dir, runmode=RunMode.DRY_RUN)
+
+    class Unreadable(type(Path())):
+        def exists(self) -> bool:
+            raise PermissionError(13, "Permission denied", str(self))
+
+    class Broken(type(Path())):
+        def exists(self) -> bool:
+            raise OSError(5, "Input/output error", str(self))
+
+    with caplog.at_level(logging.WARNING, logger="BtcTrend"):
+        monkeypatch.setattr(s, "killswitch_path", lambda: Unreadable(tmp_path / "killswitch.lock"))
+        assert s.killswitch_active() is True
+        assert s.confirm_trade_entry(PAIR, "limit", 0.01, 50_000.0, "GTC", NOW, "trend_up", "long") is False
+        monkeypatch.setattr(s, "killswitch_path", lambda: Broken(tmp_path / "killswitch.lock"))
+        s._last_warn.clear()
+        assert s.killswitch_active() is False
+    messages = [r.getMessage() for r in caplog.records if "cannot read" in r.getMessage()]
+    assert any("active" in m and "Permission denied" in m for m in messages)
+    assert any("inactive" in m and "Input/output error" in m for m in messages)
+    # A missing directory is simply "no lock".
+    monkeypatch.setattr(s, "killswitch_path", lambda: tmp_path / "missing" / "killswitch.lock")
+    assert s.killswitch_active() is False
+
+
+def test_unknown_volatility_means_no_entry_and_no_rebalance(strategy_dir: Path) -> None:
+    s = load(strategy_dir)
+    df = analyse(s, make_dataframe(noise=0.04))
+    df.loc[df.index[-1], "rvol"] = np.nan
+    s.dp._set_cached_df(PAIR, s.timeframe, df, CandleType.SPOT)
+    assert s.target_exposure(PAIR) is None
+    rate = float(df["close"].iloc[-1])
+    assert s.custom_stake_amount(PAIR, NOW, rate, 990.0, 5.8, 990.0, 1.0, "trend_up", "long") == 0.0
+    s.wallets = FakeWallets(800.0)
+    trade = fake_trade(amount=200.0 / rate, opened=NOW - timedelta(days=10))
+    assert s.adjust_trade_position(trade, NOW, rate, 0.0, 5.8, 800.0, rate, rate, 0.0, 0.0) is None
+    # No analysed dataframe at all: same answer instead of a full-size stake.
+    s.dp = DataProvider(base_config(strategy_dir, "BtcTrend", RunMode.BACKTEST), None)
+    assert s.target_exposure(PAIR) is None
+    assert s.custom_stake_amount(PAIR, NOW, rate, 990.0, 5.8, 990.0, 1.0, "trend_up", "long") == 0.0
+
+
+def test_refusals_are_logged_once_per_hour(strategy_dir: Path, tmp_path: Path, monkeypatch, caplog) -> None:
+    monkeypatch.setenv("GUARD_DIR", str(tmp_path))
+    (tmp_path / "killswitch.lock").write_text("locked\n")
+    s = load(strategy_dir, runmode=RunMode.DRY_RUN)
+    args = (PAIR, "limit", 0.01, 50_000.0, "GTC")
+    young = fake_trade(0.01, NOW - timedelta(days=2))
+    with caplog.at_level(logging.INFO, logger="BtcTrend"):
+        for offset in (0, 5, 10, 3600, 3605):
+            t = NOW + timedelta(seconds=offset)
+            assert s.confirm_trade_entry(*args, t, "trend_up", "long") is False
+            assert (
+                s.confirm_trade_exit(PAIR, young, "limit", 0.01, 50_000.0, "GTC", "exit_signal", t) is False
+            )
+    entry_msgs = [
+        r for r in caplog.records if "entry refused" in r.getMessage() and r.levelno >= logging.WARNING
+    ]
+    veto_msgs = [r for r in caplog.records if "vetoed" in r.getMessage() and r.levelno >= logging.INFO]
+    assert len(entry_msgs) == 2
+    assert len(veto_msgs) == 2
 
 
 def test_adjust_trade_position_waits_one_candle_after_fill(strategy_dir: Path) -> None:
@@ -324,6 +486,36 @@ def test_gate_blocks_entries_only_when_valid_gate_risk_off(
     s.bot_loop_start(NOW)
     old = fake_trade(0.01, NOW - timedelta(days=9))
     assert s.confirm_trade_exit(PAIR, old, "limit", 0.01, 50_000.0, "GTC", "exit_signal", NOW) is True
+
+
+def test_gate_blocks_rebalance_buys_but_not_partial_exits(
+    strategy_dir: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """Position adjustments bypass confirm_trade_entry in Freqtrade, so the gate must act in the hook."""
+    monkeypatch.setenv("ADVISOR_DIR", str(tmp_path))
+    monkeypatch.setenv("GUARD_DIR", str(tmp_path))
+    s = load(strategy_dir, "BtcAdvisorGated", runmode=RunMode.DRY_RUN)
+    df = analyse(s, make_dataframe(noise=0.04))
+    rate = float(df["close"].iloc[-1])
+    opened = NOW - timedelta(days=10)
+    under = fake_trade(amount=200.0 / rate, opened=opened)
+    over = fake_trade(amount=950.0 / rate, opened=opened)
+
+    write_decision(tmp_path)
+    s.bot_loop_start(NOW)
+    assert s._gate_block is True
+    s.wallets = FakeWallets(800.0)
+    assert s.adjust_trade_position(under, NOW, rate, 0.0, 5.8, 800.0, rate, rate, 0.0, 0.0) is None
+    assert s.custom_stake_amount(PAIR, NOW, rate, 990.0, 5.8, 990.0, 1.0, "trend_up", "long") == 0.0
+    s.wallets = FakeWallets(50.0)
+    result = s.adjust_trade_position(over, NOW, rate, 0.0, 5.8, 50.0, rate, rate, 0.0, 0.0)
+    assert result is not None and result[0] < 0 and result[1] == "rebalance_down"
+
+    write_decision(tmp_path, regime="neutral")
+    s.bot_loop_start(NOW)
+    s.wallets = FakeWallets(800.0)
+    result = s.adjust_trade_position(under, NOW, rate, 0.0, 5.8, 800.0, rate, rate, 0.0, 0.0)
+    assert result is not None and result[1] == "rebalance_up"
 
 
 def test_gate_fails_open_and_warns_once_per_hour(

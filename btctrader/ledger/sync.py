@@ -26,7 +26,7 @@ from typing import Any, Protocol
 
 from btctrader.common.config import Settings
 from btctrader.common.db import iso_utc, parse_iso
-from btctrader.ledger.errors import LedgerError
+from btctrader.ledger.errors import FifoError, LedgerError, ccxt_errors
 from btctrader.ledger.fifo import FifoResult, rebuild
 from btctrader.ledger.fills import (
     EXCHANGE,
@@ -35,7 +35,7 @@ from btctrader.ledger.fills import (
     UpsertResult,
     assert_chain,
     dec,
-    get_state,
+    delete_state,
     set_state,
     upsert_fills,
 )
@@ -44,8 +44,13 @@ log = logging.getLogger(__name__)
 
 STATE_LAST_FILL_TS = "last_fill_ts"
 STATE_LAST_SYNC = "last_sync_utc"
+STATE_FIFO_ERROR = "fifo_error"
+STATE_FIFO_ERROR_UTC = "fifo_error_utc"
 CCXT_SYMBOL = "BTC/EUR"
 EXCHANGE_PAGE_LIMIT = 1000
+
+# (source, dry_run) the fills of each ledger source carry; an account holds exactly one kind.
+SOURCE_MODES: dict[str, tuple[str, int]] = {"exchange": ("exchange", 0), "freqtrade-db": ("freqtrade-db", 1)}
 
 
 class ExchangeLike(Protocol):
@@ -68,6 +73,7 @@ class SyncResult:
     fifo: FifoResult | None
     last_fill_ts: str | None
     warnings: list[str] = field(default_factory=list)
+    fifo_error: str | None = None  # set when the FIFO rebuild failed; lots/disposals are stale then
 
 
 # -- exchange ------------------------------------------------------------------------
@@ -79,14 +85,27 @@ def make_exchange(settings: Settings) -> Any:
 
     if not (settings.bitvavo_api_key_ro and settings.bitvavo_api_secret_ro):
         raise LedgerError("LEDGER_SOURCE=exchange needs BITVAVO_API_KEY_RO and BITVAVO_API_SECRET_RO")
-    return ccxt.bitvavo(
-        {
-            "apiKey": settings.bitvavo_api_key_ro,
-            "secret": settings.bitvavo_api_secret_ro,
-            "enableRateLimit": True,
-            "options": {"operatorId": int(settings.bitvavo_operator_id)},
-        }
-    )
+    try:
+        return ccxt.bitvavo(
+            {
+                "apiKey": settings.bitvavo_api_key_ro,
+                "secret": settings.bitvavo_api_secret_ro,
+                "enableRateLimit": True,
+                "options": {"operatorId": int(settings.bitvavo_operator_id)},
+            }
+        )
+    except ccxt.BaseError as exc:
+        raise LedgerError(f"cannot create ccxt.bitvavo client: {type(exc).__name__}: {exc}") from exc
+
+
+def _fetch_my_trades(
+    exchange: ExchangeLike, symbol: str, since: int | None, limit: int, params: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """``fetch_my_trades`` with ccxt errors (network, rate limit, auth) turned into ``LedgerError``."""
+    try:
+        return exchange.fetch_my_trades(symbol, since, limit, params)
+    except ccxt_errors() as exc:
+        raise LedgerError(f"exchange trades failed: {type(exc).__name__}: {exc}") from exc
 
 
 def _raw_or_unified(trade: dict[str, Any], raw_key: str, unified_key: str) -> Any:
@@ -138,42 +157,77 @@ def fetch_exchange_fills(
 ) -> list[Fill]:
     """Page through ``fetch_my_trades`` and convert to fills.
 
-    Bitvavo returns the newest trades of a window first, so pages walk backwards by
-    passing ``until`` (ccxt maps it to the ``end`` query parameter) below the oldest
-    trade received, until a page is short or reaches ``since_ms``.
+    Bitvavo documents that a window returns its newest trades first, so pages walk
+    backwards by passing ``until`` (ccxt maps it to the ``end`` query parameter)
+    below the oldest trade received. Because that ordering was not verified against
+    the private endpoint, the walk is direction-agnostic: whenever a full page was
+    seen, a forward pass with ``since = newest + 1`` follows, so trades are complete
+    even if the server hands out the oldest ``limit`` trades of the window.
     """
     fills: dict[str, Fill] = {}
-    cursor_end: int | None = None
-    for _ in range(max_pages):
-        params: dict[str, Any] = {} if cursor_end is None else {"until": cursor_end}
-        trades = exchange.fetch_my_trades(symbol, since_ms, page_limit, params)
-        if not trades:
-            break
+    newest: int | None = None
+    saw_full_page = False
+
+    def take(trades: list[dict[str, Any]]) -> tuple[int, int | None, int | None]:
+        """Store new fills; return (new count, oldest ts, newest ts) of the page."""
+        nonlocal newest
         new = 0
-        oldest: int | None = None
+        lo: int | None = None
+        hi: int | None = None
         for trade in trades:
             fill = fill_from_ccxt_trade(trade, account_id)
             if fill.exchange_trade_id not in fills:
                 fills[fill.exchange_trade_id] = fill
                 new += 1
             ts = int(trade.get("timestamp") or 0)
-            oldest = ts if oldest is None else min(oldest, ts)
+            lo = ts if lo is None else min(lo, ts)
+            hi = ts if hi is None else max(hi, ts)
+        if hi is not None:
+            newest = hi if newest is None else max(newest, hi)
+        return new, lo, hi
+
+    cursor_end: int | None = None
+    pages = 0
+    while pages < max_pages:
+        pages += 1
+        params: dict[str, Any] = {} if cursor_end is None else {"until": cursor_end}
+        trades = _fetch_my_trades(exchange, symbol, since_ms, page_limit, params)
+        if not trades:
+            break
+        new, oldest, _ = take(trades)
+        if len(trades) >= page_limit:
+            saw_full_page = True
         if new == 0 or len(trades) < page_limit or oldest is None:
             break
         cursor_end = oldest - 1
         if since_ms is not None and cursor_end < since_ms:
             break
+    # Forward pass: only needed when a page was full (a short page already held the whole window).
+    while saw_full_page and newest is not None and pages < max_pages:
+        pages += 1
+        trades = _fetch_my_trades(exchange, symbol, newest + 1, page_limit, {})
+        if not trades:
+            break
+        new, _, _ = take(trades)
+        if new == 0 or len(trades) < page_limit:
+            break
+    if pages >= max_pages:
+        log.warning("exchange trades: stopped after %d pages, history may be incomplete", pages)
     return sorted(fills.values(), key=lambda f: (f.ts_utc, f.exchange_trade_id))
 
 
 # -- freqtrade db ---------------------------------------------------------------------
 
+# Every non-open order with a filled amount is a fill. Freqtrade keeps a partially filled
+# entry that timed out as status 'canceled' with filled > 0 (freqtradebot.handle_cancel_enter,
+# reason PARTIALLY_FILLED) and counts that amount as bought, so no status filter here.
 _FT_QUERY = """
 SELECT o.id AS o_id, o.order_id, o.ft_order_side, o.ft_pair, o.side, o.status, o.filled, o.amount,
        o.average, o.price, o.cost, o.order_filled_date, o.order_date, o.ft_fee_base, o.ft_order_tag,
-       t.id AS trade_id, t.fee_open, t.fee_close, t.enter_tag, t.exit_reason, t.strategy
+       t.id AS trade_id, t.fee_open, t.fee_close, t.fee_open_currency, t.fee_close_currency,
+       t.enter_tag, t.exit_reason, t.strategy
 FROM orders o JOIN trades t ON t.id = o.ft_trade_id
-WHERE o.ft_is_open = 0 AND o.status = 'closed' AND COALESCE(o.filled, 0) > 0 AND o.ft_pair = ?
+WHERE o.ft_is_open = 0 AND COALESCE(o.filled, 0) > 0 AND o.ft_pair = ?
 ORDER BY COALESCE(o.order_filled_date, o.order_date), o.id
 """
 
@@ -213,10 +267,19 @@ def fills_from_freqtrade_db(
             continue
         price = dec(price_raw, "average")
         fee_base = row["ft_fee_base"]
+        fee_cur_ft = str(row["fee_open_currency" if side == "buy" else "fee_close_currency"] or "").upper()
         if fee_base is not None and dec(fee_base) > 0:
             fee_amount: Decimal = dec(fee_base)
             fee_currency = "BTC"
         else:
+            if fee_cur_ft == "BTC":
+                # Freqtrade "ate the fee into dust" (apply_fee_conditional returned None), so the
+                # BTC amount is unknown; the EUR estimate below records no fee disposal.
+                log.warning(
+                    "order %s: Freqtrade fee in BTC but ft_fee_base is NULL (fee eaten into dust); "
+                    "fee booked as EUR estimate, no BTC fee disposal",
+                    row["order_id"],
+                )
             ratio = dec(row["fee_open"] if side == "buy" else row["fee_close"] or 0)
             fee_amount = filled * price * ratio
             fee_currency = "EUR"
@@ -248,12 +311,57 @@ def fills_from_freqtrade_db(
 # -- orchestration --------------------------------------------------------------------
 
 
-def _since_ms_from_state(conn: sqlite3.Connection, overlap_days: int = 3) -> int | None:
-    last = get_state(conn, STATE_LAST_FILL_TS)
+def _since_ms_for_account(conn: sqlite3.Connection, account_id: str, overlap_days: int = 3) -> int | None:
+    """Start of the exchange window: newest stored *exchange* fill of this account minus an overlap.
+
+    Derived from the account's own fills, not from the global ``last_fill_ts`` key, so a
+    new account id in an existing DB starts with the full history.
+    """
+    last = _last_fill_ts(conn, account_id, "exchange")
     if not last:
         return None
     ts = parse_iso(last).timestamp() - overlap_days * 86_400
     return max(0, int(ts * 1000))
+
+
+def assert_same_mode(
+    conn: sqlite3.Connection, account_id: str, source: str, exchange: str = EXCHANGE
+) -> None:
+    """Refuse to mix dry-run and real fills in one account.
+
+    FIFO, tax report, fees and equity figures never filter on ``source``/``dry_run``,
+    so a go-live that keeps ``LEDGER_ACCOUNT_ID`` would turn months of simulated
+    buys into real lots. The live phase needs a new account id (or a new DB).
+    """
+    expected = SOURCE_MODES.get(source)
+    if expected is None:
+        raise LedgerError(f"unknown ledger source {source!r}")
+    rows = conn.execute(
+        "SELECT DISTINCT source, dry_run FROM fills WHERE exchange = ? AND account_id = ?",
+        (exchange, account_id),
+    ).fetchall()
+    foreign = [(str(r["source"]), int(r["dry_run"])) for r in rows]
+    foreign = [mode for mode in foreign if mode != expected]
+    if foreign:
+        found = ", ".join(f"source={s!r} dry_run={d}" for s, d in foreign)
+        raise LedgerError(
+            f"account {account_id!r} already holds fills of another kind ({found}); "
+            f"LEDGER_SOURCE={source!r} would mix them with source={expected[0]!r} dry_run={expected[1]}. "
+            "Use a new LEDGER_ACCOUNT_ID (for example 'bitvavo-live') or a new LEDGER_DB_PATH for this phase."
+        )
+
+
+def _last_fill_ts(
+    conn: sqlite3.Connection, account_id: str, source: str, exchange: str = EXCHANGE
+) -> str | None:
+    """Newest ``ts_utc`` of the account's fills of this source, compared as time (not as string)."""
+    rows = conn.execute(
+        "SELECT ts_utc FROM fills WHERE exchange = ? AND account_id = ? AND source = ?",
+        (exchange, account_id, source),
+    ).fetchall()
+    if not rows:
+        return None
+    return max((str(r["ts_utc"]) for r in rows), key=parse_iso)
 
 
 def run_sync(
@@ -266,28 +374,42 @@ def run_sync(
     since_ms: int | None = None,
     rebuild_fifo: bool = True,
 ) -> SyncResult:
-    """Fetch fills from the configured source, store them, rebuild FIFO and update ``sync_state``."""
+    """Fetch fills from the configured source, store them, rebuild FIFO and update ``sync_state``.
+
+    A failing FIFO rebuild (for example a sell that exceeds the lots held) does not
+    raise: the fills stay stored, ``lots``/``disposals`` keep their previous content,
+    the message lands in ``sync_state`` (``fifo_error``, ``fifo_error_utc``) and in
+    ``SyncResult.fifo_error``. The keys are removed by the next successful rebuild.
+    """
     src = source or settings.ledger_source
     account_id = settings.ledger_account_id
     assert_chain(conn, account_id, EXCHANGE)
+    assert_same_mode(conn, account_id, src)
     if src == "exchange":
         client = exchange if exchange is not None else make_exchange(settings)
-        since = since_ms if since_ms is not None else _since_ms_from_state(conn)
+        since = since_ms if since_ms is not None else _since_ms_for_account(conn, account_id)
         fills: Sequence[Fill] = fetch_exchange_fills(client, account_id, since_ms=since)
-    elif src == "freqtrade-db":
-        fills = fills_from_freqtrade_db(ft_db_path or settings.ft_db_path, account_id)
     else:
-        raise LedgerError(f"unknown ledger source {src!r}")
+        fills = fills_from_freqtrade_db(ft_db_path or settings.ft_db_path, account_id)
     upsert = upsert_fills(conn, fills)
     for conflict in upsert.conflicts or []:
         log.warning("fill conflict: %s", conflict)
-    fifo = rebuild(conn, account_id) if rebuild_fifo else None
-    last_row = conn.execute(
-        "SELECT MAX(ts_utc) AS ts FROM fills WHERE exchange = ? AND account_id = ?", (EXCHANGE, account_id)
-    ).fetchone()
-    last_ts = last_row["ts"] if last_row and last_row["ts"] else None
+    fifo: FifoResult | None = None
+    fifo_error: str | None = None
+    if rebuild_fifo:
+        try:
+            fifo = rebuild(conn, account_id)
+        except FifoError as exc:
+            fifo_error = str(exc)
+            log.error("FIFO rebuild failed, lots/disposals are stale: %s", exc)
+            set_state(conn, STATE_FIFO_ERROR, fifo_error)
+            set_state(conn, STATE_FIFO_ERROR_UTC, iso_utc(datetime.now(tz=UTC)))
+        else:
+            delete_state(conn, STATE_FIFO_ERROR)
+            delete_state(conn, STATE_FIFO_ERROR_UTC)
+    last_ts = _last_fill_ts(conn, account_id, SOURCE_MODES[src][0])
     if last_ts:
-        set_state(conn, STATE_LAST_FILL_TS, str(last_ts))
+        set_state(conn, STATE_LAST_FILL_TS, last_ts)
     set_state(conn, STATE_LAST_SYNC, iso_utc(datetime.now(tz=UTC)))
     log.info(
         "sync %s: fetched=%d inserted=%d unchanged=%d meta=%d conflicts=%d lots=%s disposals=%s",
@@ -307,4 +429,5 @@ def run_sync(
         fifo=fifo,
         last_fill_ts=last_ts,
         warnings=list(upsert.conflicts or []),
+        fifo_error=fifo_error,
     )

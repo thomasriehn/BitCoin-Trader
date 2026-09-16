@@ -13,10 +13,23 @@ Checks in order (numbers refer to the contract):
   2. Day rollover at 00:00 UTC sets ``day_start_equity``; a loss of at least
      ``daily_loss_pct`` triggers ``stopentry`` once per UTC day.
   3. ``peak_equity`` tracks the equity high; a drawdown of at least
-     ``max_drawdown_pct`` triggers ``forceexit`` + ``stopentry`` + lock file.
-     While the lock exists, ``stopentry`` is re-applied on every run.
+     ``max_drawdown_pct`` triggers ``forceexit`` (market order, so the exit
+     fills in the very crash it reacts to) + ``stopentry`` + lock file.
+     While the lock exists, ``stopentry`` is re-applied on every run (reason
+     ``killswitch_lock``) as long as the bot reports state ``running`` (a bot
+     the operator paused or stopped is left alone). The daily-loss and
+     drawdown triggers are suspended, only bookkeeping (day start, peak)
+     continues. If Freqtrade still reports open trades under the lock, the
+     ``forceexit`` is re-issued on every run and a rate-limited alert
+     (``killswitch_open_trades``) tells the operator that the account is not
+     flat. Reconciliation, advisor and Freqtrade checks still run, and their
+     alerts are rate-limited as usual.
   4. Reconciliation (live only): exchange vs. Freqtrade balances; a mismatch
-     above the tolerance on two consecutive runs triggers ``stopentry``.
+     above the tolerance on two consecutive runs triggers ``stopentry``. A run
+     without exchange data is neither a match nor a mismatch: the counter is
+     left unchanged. Consecutive exchange failures are counted and alerted
+     after 3 (rate-limited), because reconciliation is the only detector for
+     foreign orders on the account.
   5. Advisor freshness (``ADVISOR_MODE=gate`` only): alert at most every 6 hours
      when ``decision.json`` is missing or older than 3 x interval.
   6. Optional ``cancelOrdersAfter`` renewal when the bot is reachable.
@@ -51,6 +64,15 @@ ADVISOR_STALE_FACTOR = 3
 RECONCILE_RUNS_REQUIRED = 2
 """Consecutive runs with a balance mismatch before the guard reacts."""
 
+EXCHANGE_FAILURE_ALERT_AFTER = 3
+"""Consecutive failed exchange balance fetches (live) before an alert is sent."""
+
+FORCEEXIT_ORDERTYPE = "market"
+"""Order type for the kill-switch exit: a resting limit order may never fill in a crash."""
+
+BOT_STATE_RUNNING = "running"
+"""Freqtrade ``show_config.state`` value while the bot may open positions."""
+
 # Event names written to events.jsonl
 EVENT_DAY_START = "day_start"
 EVENT_DAILY_LOSS = "daily_loss"
@@ -61,6 +83,9 @@ EVENT_ADVISOR_STALE = "advisor_stale"
 EVENT_FT_UNREACHABLE = "ft_unreachable"
 EVENT_FT_RECOVERED = "ft_recovered"
 EVENT_ACTION_FAILED = "action_failed"
+EVENT_KILLSWITCH_OPEN_TRADES = "killswitch_open_trades"
+EVENT_EXCHANGE_UNREACHABLE = "exchange_unreachable"
+EVENT_EXCHANGE_RECOVERED = "exchange_recovered"
 
 # Action kinds
 ACTION_STOPENTRY = "stopentry"
@@ -69,6 +94,19 @@ ACTION_WRITE_LOCK = "write_lock"
 ACTION_ALERT = "alert"
 ACTION_EVENT = "event"
 ACTION_COD_RENEW = "cod_renew"
+
+ACTION_PRIORITY: dict[str, int] = {
+    ACTION_FORCEEXIT: 0,
+    ACTION_STOPENTRY: 1,
+    ACTION_WRITE_LOCK: 2,
+    ACTION_EVENT: 3,
+    ACTION_ALERT: 4,
+    ACTION_COD_RENEW: 5,
+}
+"""Execution order: exchange-facing control first, then bookkeeping, then slow network alerts."""
+
+CRITICAL_ACTIONS = frozenset({ACTION_FORCEEXIT, ACTION_STOPENTRY, ACTION_WRITE_LOCK})
+"""Actions whose failure must be alerted (the guard's protective effect depends on them)."""
 
 ZERO = Decimal(0)
 HUNDRED = Decimal(100)
@@ -120,6 +158,10 @@ class Observations:
     exchange_eur: Decimal | None = None
     exchange_btc: Decimal | None = None
     btc_price: Decimal | None = None
+    exchange_error: str = ""
+    """Non-empty when the live balance fetch was attempted and failed."""
+    bot_state: str | None = None
+    """Freqtrade ``show_config.state`` (``running``, ``paused``, ``stopped``); None when unknown."""
     lock_exists: bool = False
     advisor_created_at: datetime | None = None
 
@@ -130,6 +172,11 @@ class Observations:
     @property
     def exchange_available(self) -> bool:
         return self.exchange_eur is not None and self.exchange_btc is not None
+
+    @property
+    def bot_may_enter(self) -> bool:
+        """True unless Freqtrade reports a state other than ``running`` (unknown counts as running)."""
+        return self.bot_state is None or self.bot_state == BOT_STATE_RUNNING
 
 
 @dataclass(frozen=True)
@@ -142,6 +189,7 @@ class GuardState:
     peak_equity: Decimal | None = None
     ft_failures: int = 0
     reconcile_mismatches: int = 0
+    exchange_failures: int = 0
     last_alerts: dict[str, datetime] = field(default_factory=dict)
     last_equity: Decimal | None = None
     last_check: datetime | None = None
@@ -157,6 +205,7 @@ class GuardState:
             "peak_equity": _dec_str(self.peak_equity),
             "ft_failures": self.ft_failures,
             "reconcile_mismatches": self.reconcile_mismatches,
+            "exchange_failures": self.exchange_failures,
             "last_alerts": {k: iso_utc(v) for k, v in sorted(self.last_alerts.items())},
             "last_equity": _dec_str(self.last_equity),
             "last_check": iso_utc(self.last_check) if self.last_check else None,
@@ -183,6 +232,7 @@ class GuardState:
             peak_equity=_parse_dec(data.get("peak_equity")),
             ft_failures=_parse_int(data.get("ft_failures")),
             reconcile_mismatches=_parse_int(data.get("reconcile_mismatches")),
+            exchange_failures=_parse_int(data.get("exchange_failures")),
             last_alerts=alerts,
             last_equity=_parse_dec(data.get("last_equity")),
             last_check=_parse_dt(data.get("last_check")),
@@ -195,7 +245,8 @@ class GuardState:
 class Action:
     """Something the CLI has to do. ``details`` depends on ``kind``.
 
-    * ``stopentry`` / ``forceexit``: ``reason``
+    * ``stopentry``: ``reason``
+    * ``forceexit``: ``reason``, ``tradeid``, ``ordertype``
     * ``write_lock``: ``content`` (dict written to ``killswitch.lock``)
     * ``alert``: ``title``, ``message``, ``priority``
     * ``event``: ``event``, ``details``
@@ -308,7 +359,7 @@ def advisor_is_stale(created_at: datetime | None, now: datetime, interval_hours:
     return now - created_at > max_age
 
 
-def _may_alert(state: GuardState, key: str, now: datetime, hours: float) -> bool:
+def may_alert(state: GuardState, key: str, now: datetime, hours: float) -> bool:
     last = state.last_alerts.get(key)
     return last is None or now - last >= timedelta(hours=hours)
 
@@ -361,7 +412,26 @@ def evaluate(state: GuardState, obs: Observations, cfg: GuardConfig) -> tuple[Gu
     new, actions = _check_advisor(new, obs, cfg, actions)
     if cfg.cod_enabled:
         actions.append(Action(ACTION_COD_RENEW, {"seconds": cfg.cod_seconds}))
-    return new, actions
+    return new, _dedupe_stopentry(actions)
+
+
+def _dedupe_stopentry(actions: list[Action]) -> list[Action]:
+    """Keep only the first ``stopentry`` per run (one POST is enough; the reason of the first wins)."""
+    result: list[Action] = []
+    seen = False
+    for action in actions:
+        if action.kind == ACTION_STOPENTRY:
+            if seen:
+                continue
+            seen = True
+        result.append(action)
+    return result
+
+
+def prioritize_actions(actions: list[Action]) -> list[Action]:
+    """Stable sort by ``ACTION_PRIORITY``: control calls to Freqtrade and the lock file first,
+    alerts (slow external HTTP, possibly timing out) last. Unknown kinds go to the end."""
+    return sorted(actions, key=lambda a: ACTION_PRIORITY.get(a.kind, len(ACTION_PRIORITY)))
 
 
 def _check_ft_unreachable(
@@ -370,7 +440,7 @@ def _check_ft_unreachable(
     failures = state.ft_failures + 1
     error = obs.ft_error or "no equity in /balance"
     actions.append(event(EVENT_FT_UNREACHABLE, failures=failures, error=error))
-    if failures >= cfg.ft_failure_alert_after and _may_alert(
+    if failures >= cfg.ft_failure_alert_after and may_alert(
         state, EVENT_FT_UNREACHABLE, obs.now, cfg.alert_repeat_hours
     ):
         actions.append(
@@ -393,6 +463,10 @@ def _check_daily_loss(
         state = replace(state, day_key=day, day_start_equity=equity)
     start = state.day_start_equity
     assert start is not None
+    if obs.lock_exists:
+        # Kill switch active: positions are closed and stopentry is re-applied by
+        # _check_drawdown; a daily-loss alert would only repeat the same news.
+        return state, actions
     change = pct_change(start, equity)
     if change <= -cfg.daily_loss_pct and state.daily_loss_day != day:
         details = {
@@ -428,20 +502,26 @@ def _check_drawdown(
 
     if obs.lock_exists:
         # Kill switch active: keep the bot from entering, whatever anyone sent via /start.
-        actions.append(Action(ACTION_STOPENTRY, {"reason": "killswitch_lock"}))
+        # A bot the operator paused or stopped is left alone: /stopentry on a stopped
+        # bot would silently restart it in paused state.
+        if obs.bot_may_enter:
+            actions.append(Action(ACTION_STOPENTRY, {"reason": "killswitch_lock"}))
+        if obs.open_trades > 0:
+            state, actions = _retry_killswitch_exit(state, obs, cfg, actions)
         return state, actions
 
     if dd >= cfg.max_drawdown_pct:
         content = lock_content(obs.now, equity, peak, EVENT_KILLSWITCH)
-        actions.append(Action(ACTION_FORCEEXIT, {"reason": EVENT_KILLSWITCH, "tradeid": "all"}))
+        actions.append(_forceexit_action(EVENT_KILLSWITCH))
         actions.append(Action(ACTION_STOPENTRY, {"reason": EVENT_KILLSWITCH}))
         actions.append(Action(ACTION_WRITE_LOCK, {"content": content}))
         actions.append(
             alert(
                 "Guard: KILL-SWITCH ausgelöst",
                 f"Drawdown {q2(dd)} % vom Hoch ({fmt_eur(peak)}), Equity {fmt_eur(equity)}, "
-                f"Limit {cfg.max_drawdown_pct} %. Alle Positionen werden geschlossen, "
-                "stopentry gesetzt, killswitch.lock geschrieben. Zurücksetzen nur mit "
+                f"Limit {cfg.max_drawdown_pct} %. Alle Positionen werden per Market-Order "
+                "geschlossen (Taker-Gebühr, dafür sofort ausgeführt), stopentry gesetzt, "
+                "killswitch.lock geschrieben. Zurücksetzen nur mit "
                 "'btctrader-guard reset --confirm'.",
                 priority="urgent",
             )
@@ -460,14 +540,49 @@ def _check_drawdown(
     return state, actions
 
 
+def _forceexit_action(reason: str) -> Action:
+    return Action(ACTION_FORCEEXIT, {"reason": reason, "tradeid": "all", "ordertype": FORCEEXIT_ORDERTYPE})
+
+
+def _retry_killswitch_exit(
+    state: GuardState, obs: Observations, cfg: GuardConfig, actions: list[Action]
+) -> tuple[GuardState, list[Action]]:
+    """Lock exists but Freqtrade still reports open trades: the exit order failed, was
+    cancelled (unfilled limit order) or never happened. Re-issue ``forceexit`` on every
+    run (Freqtrade cancels a resting exit order and places a new one) and tell the
+    operator, rate-limited."""
+    actions.append(_forceexit_action(EVENT_KILLSWITCH_OPEN_TRADES))
+    if may_alert(state, EVENT_KILLSWITCH_OPEN_TRADES, obs.now, cfg.alert_repeat_hours):
+        actions.append(
+            alert(
+                "Guard: Kill-Switch, Positionen noch offen",
+                f"killswitch.lock ist gesetzt, Freqtrade meldet aber noch {obs.open_trades} offene "
+                f"Position(en). forceexit (Market) wird erneut gesendet. Bot-Status: "
+                f"{obs.bot_state or 'unbekannt'}. Prüfe Freqtrade und das Börsenkonto.",
+                priority="urgent",
+            )
+        )
+        actions.append(
+            event(EVENT_KILLSWITCH_OPEN_TRADES, open_trades=obs.open_trades, bot_state=obs.bot_state)
+        )
+        state.last_alerts[EVENT_KILLSWITCH_OPEN_TRADES] = obs.now
+    return state, actions
+
+
 def _check_reconcile(
     state: GuardState, obs: Observations, cfg: GuardConfig, actions: list[Action]
 ) -> tuple[GuardState, list[Action]]:
-    """Check 4: only live (``dry_run`` False) and only when exchange balances were fetched."""
-    if obs.dry_run is not False or not obs.exchange_available:
-        return replace(state, reconcile_mismatches=0), actions
-    if obs.ft_eur is None or obs.ft_btc is None:
-        return replace(state, reconcile_mismatches=0), actions
+    """Check 4: only live (``dry_run`` False) and only when exchange balances were fetched.
+
+    A run without exchange data leaves ``reconcile_mismatches`` unchanged (it is neither
+    a match nor a mismatch), so intermittent exchange errors cannot hide a persistent
+    mismatch. Dry-run resets the counter.
+    """
+    if obs.dry_run is not False:
+        return replace(state, reconcile_mismatches=0, exchange_failures=0), actions
+    state, actions = _track_exchange_failures(state, obs, cfg, actions)
+    if not obs.exchange_available or obs.ft_eur is None or obs.ft_btc is None:
+        return state, actions
     assert obs.exchange_eur is not None and obs.exchange_btc is not None
     diff = reconcile_diff_eur(obs.ft_eur, obs.ft_btc, obs.exchange_eur, obs.exchange_btc, obs.btc_price)
     mismatch = diff is None or diff > cfg.reconcile_tol_eur
@@ -480,7 +595,7 @@ def _check_reconcile(
         return state, actions
 
     actions.append(Action(ACTION_STOPENTRY, {"reason": EVENT_RECONCILE_MISMATCH}))
-    if runs == RECONCILE_RUNS_REQUIRED or _may_alert(
+    if runs == RECONCILE_RUNS_REQUIRED or may_alert(
         state, EVENT_RECONCILE_MISMATCH, obs.now, cfg.alert_repeat_hours
     ):
         diff_text = "nicht bewertbar (kein BTC-Kurs)" if diff is None else fmt_eur(diff)
@@ -510,6 +625,43 @@ def _check_reconcile(
     return state, actions
 
 
+def _track_exchange_failures(
+    state: GuardState, obs: Observations, cfg: GuardConfig, actions: list[Action]
+) -> tuple[GuardState, list[Action]]:
+    """Count consecutive failed balance fetches (live); alert after
+    ``EXCHANGE_FAILURE_ALERT_AFTER`` (rate-limited), recovery event when it works again."""
+    if obs.exchange_available:
+        if state.exchange_failures >= EXCHANGE_FAILURE_ALERT_AFTER:
+            actions.append(event(EVENT_EXCHANGE_RECOVERED, failures=state.exchange_failures))
+            actions.append(
+                alert(
+                    "Guard: Börsen-Bilanz wieder abrufbar",
+                    f"Nach {state.exchange_failures} Fehlläufen antwortet Bitvavo wieder, "
+                    "der Bilanzabgleich läuft.",
+                    priority="default",
+                )
+            )
+        state.last_alerts.pop(EVENT_EXCHANGE_UNREACHABLE, None)
+        return replace(state, exchange_failures=0), actions
+    if not obs.exchange_error:
+        return state, actions  # not attempted (no RO key): nothing to count
+    failures = state.exchange_failures + 1
+    if failures >= EXCHANGE_FAILURE_ALERT_AFTER and may_alert(
+        state, EVENT_EXCHANGE_UNREACHABLE, obs.now, cfg.alert_repeat_hours
+    ):
+        actions.append(event(EVENT_EXCHANGE_UNREACHABLE, failures=failures, error=obs.exchange_error))
+        actions.append(
+            alert(
+                "Guard: Börsen-Bilanz nicht abrufbar",
+                f"{failures} Fehlläufe in Folge, der Bilanzabgleich ist ausgesetzt. "
+                f"Letzter Fehler: {obs.exchange_error}. Prüfe den View-only-Key und die IP-Freigabe.",
+                priority="high",
+            )
+        )
+        state.last_alerts[EVENT_EXCHANGE_UNREACHABLE] = obs.now
+    return replace(state, exchange_failures=failures), actions
+
+
 def _check_advisor(
     state: GuardState, obs: Observations, cfg: GuardConfig, actions: list[Action]
 ) -> tuple[GuardState, list[Action]]:
@@ -518,7 +670,7 @@ def _check_advisor(
         return state, actions
     if not advisor_is_stale(obs.advisor_created_at, obs.now, cfg.advisor_interval_hours):
         return state, actions
-    if not _may_alert(state, EVENT_ADVISOR_STALE, obs.now, cfg.alert_repeat_hours):
+    if not may_alert(state, EVENT_ADVISOR_STALE, obs.now, cfg.alert_repeat_hours):
         return state, actions
     if obs.advisor_created_at is None:
         age_text = "decision.json fehlt"
@@ -553,4 +705,5 @@ def reset_state_after_unlock(state: GuardState) -> GuardState:
         peak_equity=None,
         killswitch_at=None,
         reconcile_mismatches=0,
+        exchange_failures=0,
     )

@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 from btctrader.common.ftapi import FreqtradeClient
 from btctrader.ledger.benchmarks import PriceSeries, compute_benchmarks
+from btctrader.ledger.errors import LedgerError, ccxt_errors
 from btctrader.ledger.fills import dec, fmt, q8
 
 log = logging.getLogger(__name__)
@@ -54,7 +55,10 @@ def balances_from_freqtrade(client: FreqtradeClient) -> Balances:
 
 def balances_from_exchange(exchange: BalanceExchange) -> Balances:
     """Total EUR and BTC balance from ccxt ``fetch_balance()["total"]``."""
-    data = exchange.fetch_balance({})
+    try:
+        data = exchange.fetch_balance({})
+    except ccxt_errors() as exc:
+        raise LedgerError(f"exchange balance failed: {type(exc).__name__}: {exc}") from exc
     total = data.get("total") or {}
     eur = dec(total.get("EUR", 0) or 0, "EUR balance")
     btc = dec(total.get("BTC", 0) or 0, "BTC balance")

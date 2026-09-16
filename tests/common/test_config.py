@@ -130,6 +130,29 @@ def test_empty_value_keeps_default_for_typed_fields() -> None:
     assert s.guard_cod_enabled is False
 
 
+def test_empty_value_keeps_default_for_str_fields_too() -> None:
+    # "leer = Default" must hold for every field: LEDGER_SOURCE= or TZ_DISPLAY= in the env file
+    # are placeholders, not a request for an empty (invalid) value.
+    s = load_settings({"LEDGER_SOURCE": "", "ADVISOR_MODE": " ", "TZ_DISPLAY": "", "FT_API_URL": ""})
+    assert s.ledger_source == "freqtrade-db"
+    assert s.advisor_mode == "shadow"
+    assert s.tz_display == "Europe/Berlin"
+    assert s.ft_api_url == "http://127.0.0.1:8080"
+    with pytest.raises(ConfigError, match="FT_API_USER"):
+        load_settings({"FT_API_USER": ""}, require=["ft_api_user"])  # still counts as missing
+
+
+@pytest.mark.parametrize("bind", ["0.0.0.0:8090", ":::8090", "[::]:8090", "*:8090"])
+def test_dashboard_bind_rejects_wildcard_hosts(bind: str) -> None:
+    with pytest.raises(ConfigError, match="no login"):
+        load_settings({"DASHBOARD_BIND": bind})
+
+
+def test_dashboard_bind_accepts_loopback_and_tailscale() -> None:
+    assert load_settings({"DASHBOARD_BIND": "100.64.1.2:8090"}).dashboard_bind == "100.64.1.2:8090"
+    assert load_settings({"DASHBOARD_BIND": "[::1]:8090"}).dashboard_bind == "[::1]:8090"
+
+
 def test_env_file_loading_and_precedence(tmp_path: Path) -> None:
     env_file = tmp_path / "btctrader.env"
     env_file.write_text(
@@ -137,7 +160,7 @@ def test_env_file_loading_and_precedence(tmp_path: Path) -> None:
         "FT_API_USER=filebot\n"
         "export FT_API_PASS='se cret'\n"
         'ADVISOR_MODEL="Qwen/Qwen3-14B"\n'
-        "DCA_WEEKS=26  # trailing comment\n"
+        "DCA_WEEKS=26\n"
         "BENCHMARK_START=2026-09-01\n"
         "\n",
         encoding="utf-8",
@@ -161,7 +184,22 @@ def test_default_env_file_is_used_when_present(tmp_path: Path, monkeypatch: pyte
     env_file = tmp_path / "default.env"
     env_file.write_text("TZ_DISPLAY=UTC\n", encoding="utf-8")
     monkeypatch.setattr(cfg, "DEFAULT_ENV_FILE", env_file)
-    assert load_settings({}).tz_display == "UTC"
+    monkeypatch.delenv("BTCTRADER_ENV_FILE", raising=False)
+    monkeypatch.delenv("TZ_DISPLAY", raising=False)
+    assert load_settings().tz_display == "UTC"  # process environment: default file applies
+
+
+def test_explicit_env_ignores_default_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # An explicit mapping is hermetic, otherwise every test would depend on the host's
+    # /etc/freqtrade/btctrader.env once install.sh has created it.
+    import btctrader.common.config as cfg
+
+    env_file = tmp_path / "default.env"
+    env_file.write_text("TZ_DISPLAY=UTC\nFT_API_USER=hostbot\n", encoding="utf-8")
+    monkeypatch.setattr(cfg, "DEFAULT_ENV_FILE", env_file)
+    s = load_settings({})
+    assert s.tz_display == "Europe/Berlin" and s.ft_api_user == ""
+    assert load_settings({"BTCTRADER_ENV_FILE": str(env_file)}).ft_api_user == "hostbot"
 
 
 def test_load_from_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,8 +210,47 @@ def test_load_from_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_parse_env_file_ignores_garbage(tmp_path: Path) -> None:
     f = tmp_path / "x.env"
-    f.write_text("no equals here\n=novalue\nGOOD=1\n", encoding="utf-8")
+    f.write_text("no equals here\n=novalue\nGOOD=1\n1BAD=2\nA B=3\n", encoding="utf-8")
     assert parse_env_file(f) == {"GOOD": "1"}
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        # '#' is never a comment inside a value (systemd src/basic/env-file.c, VALUE state)
+        ("A=abc #def", "abc #def"),
+        ("A=p4ss#word", "p4ss#word"),
+        # text after a closing quote is appended, blanks around it dropped
+        ('A="v" # c', "v# c"),
+        # unquoted backslash escapes the next character
+        ("A=a\\#b", "a#b"),
+        ("A=a\\\\b", "a\\b"),
+        # double quotes: only \" \\ \` \$ are unescaped, other backslashes are kept
+        ('A="q\\"x\\$y\\\\z"', 'q"x$y\\z'),
+        ('A="keep\\nthis"', "keep\\nthis"),
+        # single quotes are literal
+        ("A='lit\\n#x'", "lit\\n#x"),
+        # whitespace around an unquoted value is stripped, inner whitespace kept
+        ("A=  two words  ", "two words"),
+        ("A=", ""),
+        ('A=""', ""),
+        # escaped newline continues the line
+        ("A=one\\\ntwo", "onetwo"),
+        ('A="con\\\ntinued"', "continued"),
+    ],
+)
+def test_parse_env_file_matches_systemd(tmp_path: Path, line: str, expected: str) -> None:
+    f = tmp_path / "x.env"
+    f.write_text(line + "\n", encoding="utf-8")
+    assert parse_env_file(f) == {"A": expected}
+    f.write_text(line, encoding="utf-8")  # no trailing newline
+    assert parse_env_file(f) == {"A": expected}
+
+
+def test_parse_env_file_comment_lines_and_export(tmp_path: Path) -> None:
+    f = tmp_path / "x.env"
+    f.write_text("# c\n  ; also a comment\nexport A=1\nB=2\r\n\nC='3'\n", encoding="utf-8")
+    assert parse_env_file(f) == {"A": "1", "B": "2", "C": "3"}
 
 
 def test_settings_field_names_are_lowercase_env_names() -> None:

@@ -5,6 +5,11 @@ Base URL ``https://api.bitvavo.com/v2``. Response shapes (checked live on 15.09.
 * ``GET /{market}/candles?interval=1d&limit=..&start=..&end=..`` returns
   ``[[timestamp_ms, open, high, low, close, volume], ...]`` with numbers as
   strings, **newest first**. ``fetch_candles`` re-sorts to ascending order.
+  The newest row is the **still open** candle of the current interval (checked
+  live: at 22:46 UTC the 1d response ends with today's 00:00 UTC candle), so its
+  close changes until the interval ends. Pass ``drop_incomplete=True`` or use
+  ``closed_only`` / ``is_closed`` when a consumer needs closed candles only
+  (daily closes, SMA/volatility windows, benchmark prices).
 * ``GET /ticker/price?market=BTC-EUR`` returns ``{"market": ..., "price": "65827"}``.
 * ``GET /ticker/book?market=BTC-EUR`` returns ``{"market", "bid", "bidSize", "ask", "askSize"}``.
 * ``GET /markets?market=BTC-EUR`` returns one market object (``minOrderInQuoteAsset`` ...).
@@ -14,7 +19,9 @@ Errors come back as ``{"errorCode": int, "error": str}``.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, NamedTuple
 
@@ -24,6 +31,24 @@ BASE_URL = "https://api.bitvavo.com/v2"
 DEFAULT_TIMEOUT = 15.0
 MAX_CANDLE_LIMIT = 1440
 INTERVALS = ("1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "1W", "1M")
+_MINUTE_MS = 60_000
+_HOUR_MS = 60 * _MINUTE_MS
+_DAY_MS = 24 * _HOUR_MS
+# Fixed-length intervals in milliseconds; "1M" is a calendar month and handled in interval_end_ms.
+INTERVAL_MS: dict[str, int] = {
+    "1m": _MINUTE_MS,
+    "5m": 5 * _MINUTE_MS,
+    "15m": 15 * _MINUTE_MS,
+    "30m": 30 * _MINUTE_MS,
+    "1h": _HOUR_MS,
+    "2h": 2 * _HOUR_MS,
+    "4h": 4 * _HOUR_MS,
+    "6h": 6 * _HOUR_MS,
+    "8h": 8 * _HOUR_MS,
+    "12h": 12 * _HOUR_MS,
+    "1d": _DAY_MS,
+    "1W": 7 * _DAY_MS,
+}
 
 
 class BitvavoError(Exception):
@@ -76,6 +101,29 @@ def _dec(value: Any, what: str) -> Decimal:
     return result
 
 
+def interval_end_ms(ts_ms: int, interval: str) -> int:
+    """Timestamp (ms) at which the candle starting at ``ts_ms`` closes."""
+    if interval == "1M":
+        start = datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
+        year, month = (start.year + 1, 1) if start.month == 12 else (start.year, start.month + 1)
+        return int(datetime(year, month, 1, tzinfo=UTC).timestamp() * 1000)
+    try:
+        return ts_ms + INTERVAL_MS[interval]
+    except KeyError:
+        raise ValueError(f"unsupported interval {interval!r}; use one of {', '.join(INTERVALS)}") from None
+
+
+def is_closed(candle: Candle, interval: str, now_ms: int | None = None) -> bool:
+    """True if the candle's interval has ended, i.e. its close is final."""
+    now = int(time.time() * 1000) if now_ms is None else now_ms
+    return interval_end_ms(candle.ts_ms, interval) <= now
+
+
+def closed_only(candles: Sequence[Candle], interval: str, now_ms: int | None = None) -> list[Candle]:
+    """Return only the candles whose interval has already ended (drops the open one)."""
+    return [c for c in candles if is_closed(c, interval, now_ms)]
+
+
 def parse_candles(rows: Sequence[Sequence[Any]]) -> list[Candle]:
     """Convert raw ``[[ts, o, h, l, c, v], ...]`` rows to ``Candle`` objects, ascending by time."""
     candles: list[Candle] = []
@@ -103,9 +151,15 @@ def fetch_candles(
     *,
     start_ms: int | None = None,
     end_ms: int | None = None,
+    drop_incomplete: bool = False,
     client: httpx.Client | None = None,
 ) -> list[Candle]:
-    """Fetch OHLCV candles, ascending by time. ``limit`` is capped at 1440 (API maximum)."""
+    """Fetch OHLCV candles, ascending by time. ``limit`` is capped at 1440 (API maximum).
+
+    The API includes the still open candle of the current interval as the
+    newest row; ``drop_incomplete=True`` removes it (and anything else not yet
+    closed at call time) so the result contains final closes only.
+    """
     if interval not in INTERVALS:
         raise ValueError(f"unsupported interval {interval!r}; use one of {', '.join(INTERVALS)}")
     if limit < 1:
@@ -118,7 +172,10 @@ def fetch_candles(
     data = _get(f"/{market}/candles", params, client)
     if not isinstance(data, list):
         raise BitvavoError(f"candles: unexpected payload {type(data).__name__}")
-    return parse_candles(data)
+    candles = parse_candles(data)
+    if drop_incomplete:
+        candles = closed_only(candles, interval)
+    return candles
 
 
 def fetch_ticker_price(market: str = "BTC-EUR", *, client: httpx.Client | None = None) -> Decimal:

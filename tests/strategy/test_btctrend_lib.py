@@ -89,7 +89,9 @@ def test_exposure_from_vol(lib, target: float, rvol: float, expected: float) -> 
 
 
 def test_exposure_from_vol_fallback_when_unknown(lib) -> None:
-    assert lib.exposure_from_vol(0.35, None) == 1.0
+    # Unknown volatility never fails open to 100 %: the default fallback is no exposure.
+    assert lib.exposure_from_vol(0.35, None) == 0.0
+    assert lib.exposure_from_vol(0.35, float("nan")) == 0.0
     assert lib.exposure_from_vol(0.35, float("nan"), fallback=0.5) == 0.5
     assert lib.exposure_from_vol(0.35, None, fallback=7.0) == 1.0
     with pytest.raises(ValueError):
@@ -141,6 +143,30 @@ def test_rebalance_zero_capital(lib) -> None:
 
 
 # ------------------------------------------------------------------ candles held
+
+
+def test_partial_exit_stake_matches_freqtrade_conversion(lib) -> None:
+    # Freqtrade sells |stake| * trade.amount / trade.stake_amount base units.
+    trade_amount, open_rate = 0.02, 40_000.0
+    stake_amount = trade_amount * open_rate
+    for fraction in (0.25, 0.5, 1.0):
+        stake = lib.partial_exit_stake(fraction, stake_amount)
+        assert stake < 0
+        assert abs(stake) * trade_amount / stake_amount == pytest.approx(fraction * trade_amount)
+    assert lib.partial_exit_stake(1.7, stake_amount) == pytest.approx(-stake_amount)
+    assert lib.partial_exit_stake(-0.2, stake_amount) == 0.0
+    with pytest.raises(ValueError):
+        lib.partial_exit_stake(0.5, 0.0)
+
+
+def test_exit_min_stake_adds_stoploss_reserve(lib) -> None:
+    # exchange._get_stake_amount_limit: minimum / (1 - |stoploss|), capped at factor 1.5
+    assert lib.exit_min_stake(5.25, -0.10) == pytest.approx(5.25 / 0.9)
+    assert lib.exit_min_stake(5.25, 0.0) == pytest.approx(5.25)
+    assert lib.exit_min_stake(5.25, -0.9) == pytest.approx(5.25 * 1.5)
+    assert lib.exit_min_stake(5.25, -1.0) == pytest.approx(5.25 * 1.5)
+    with pytest.raises(ValueError):
+        lib.exit_min_stake(-1.0, -0.1)
 
 
 def test_candles_held(lib) -> None:

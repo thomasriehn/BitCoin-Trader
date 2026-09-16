@@ -39,8 +39,9 @@ def make_daily_candles(n: int = 400, *, end: datetime = NOW, start_price: float 
     return out
 
 
-def make_4h_candles(n: int = 24, *, end: datetime = NOW) -> list[Candle]:
-    base = end.replace(minute=0, second=0, microsecond=0)
+def make_4h_candles(n: int = 25, *, end: datetime = NOW) -> list[Candle]:
+    """``n`` 4h candles aligned to 4h boundaries; the newest one is still open at ``end`` (like Bitvavo)."""
+    base = end.replace(hour=end.hour - end.hour % 4, minute=0, second=0, microsecond=0)
     out: list[Candle] = []
     for i in range(n):
         ts = base - timedelta(hours=4 * (n - 1 - i))

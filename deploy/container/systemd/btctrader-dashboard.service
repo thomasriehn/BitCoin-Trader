@@ -1,0 +1,34 @@
+# Read-only dashboard (FastAPI/uvicorn) on DASHBOARD_BIND (default 127.0.0.1:8090).
+# No login, no exchange keys: reach it only through "tailscale serve" (docs/SETUP.md step 6).
+# ReadWritePaths covers only /srv/trading/ledger: SQLite in WAL mode needs to create the -shm file
+# even for read-only connections. Repo, user_data, advisor and guard stay read-only.
+[Unit]
+Description=btctrader dashboard (read-only)
+Documentation=file:///srv/trading/repo/docs/BETRIEB.md
+After=network-online.target
+Wants=network-online.target
+# No start rate limit (see freqtrade-dryrun.service): a crash loop must not end in "failed".
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=freqtrade
+Group=freqtrade
+UMask=0027
+WorkingDirectory=/srv/trading
+EnvironmentFile=/etc/freqtrade/btctrader.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/srv/trading/venv/bin/btctrader-dashboard
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/trading/ledger
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 
+from btctrader.common.db import parse_iso
 from btctrader.guard import guard
-from btctrader.guard.guard import GuardConfig, GuardState, evaluate
+from btctrader.guard.guard import Action, GuardConfig, GuardState, evaluate
 from tests.guard.conftest import T0, events, fresh_state, kinds, obs
 
 # -- day rollover and daily loss -----------------------------------------------------
@@ -76,14 +78,16 @@ def test_drawdown_triggers_forceexit_stopentry_and_lock(cfg: GuardConfig) -> Non
     state, actions = evaluate(state, obs("800", now=T0 + timedelta(minutes=2)), cfg)
     ks = [a for a in actions if a.kind in ("forceexit", "stopentry", "write_lock")]
     assert [a.kind for a in ks] == ["forceexit", "stopentry", "write_lock"]
-    assert ks[0].details["tradeid"] == "all"
+    # market order: a resting limit exit may never fill in the crash that triggered the kill switch
+    assert ks[0].details == {"reason": "killswitch", "tradeid": "all", "ordertype": "market"}
     lock = ks[2].details["content"]
     assert lock["equity_eur"] == "800.00"
     assert lock["peak_equity_eur"] == "1000.00"
     assert lock["drawdown_pct"] == "20.00"
-    assert lock["ts"] == "2026-09-15T10:02:00Z"
+    assert parse_iso(lock["ts"]) == T0 + timedelta(minutes=2) and lock["ts"].endswith("Z")
     assert guard.EVENT_KILLSWITCH in events(actions)
-    assert any(a.kind == "alert" and a.details["priority"] == "urgent" for a in actions)
+    urgent = [a for a in actions if a.kind == "alert" and a.details["priority"] == "urgent"]
+    assert len(urgent) == 1 and "Market-Order" in urgent[0].details["message"]
     assert state.killswitch_at == T0 + timedelta(minutes=2)
 
 
@@ -96,6 +100,78 @@ def test_lock_reapplies_stopentry_without_new_killswitch(cfg: GuardConfig) -> No
     state, actions = evaluate(state, obs("1200", now=T0 + timedelta(minutes=1), lock_exists=True), cfg)
     assert kinds(actions) == ["stopentry"]
     assert state.peak_equity == Decimal("1200")
+
+
+def test_lock_retries_forceexit_while_trades_are_still_open(cfg: GuardConfig) -> None:
+    """A failed, cancelled or unfilled exit leaves a position open under the lock:
+    forceexit is re-issued on every run, the alert is rate-limited."""
+    state = fresh_state(day_key="2026-09-15", day_start_equity=Decimal("800"), peak_equity=Decimal("1000"))
+    state, actions = evaluate(state, obs("700", lock_exists=True, open_trades=1), cfg)
+    assert kinds(actions) == ["stopentry", "forceexit", "alert", "event"]
+    assert actions[1].details == {"reason": "killswitch_open_trades", "tradeid": "all", "ordertype": "market"}
+    assert actions[2].details["priority"] == "urgent" and "noch offen" in actions[2].details["title"]
+    assert events(actions) == [guard.EVENT_KILLSWITCH_OPEN_TRADES]
+    assert state.last_alerts[guard.EVENT_KILLSWITCH_OPEN_TRADES] == T0
+    # one minute later, still open: forceexit again, but no second alert
+    t1 = T0 + timedelta(minutes=1)
+    state, actions = evaluate(state, obs("700", now=t1, lock_exists=True, open_trades=1), cfg)
+    assert kinds(actions) == ["stopentry", "forceexit"]
+    # 6 h later: alert again
+    later = T0 + timedelta(hours=6)
+    state, actions = evaluate(state, obs("700", now=later, lock_exists=True, open_trades=1), cfg)
+    assert kinds(actions) == ["stopentry", "forceexit", "alert", "event"]
+    # flat: only the stopentry re-apply, no forceexit
+    state, actions = evaluate(state, obs("700", now=later + timedelta(minutes=1), lock_exists=True), cfg)
+    assert kinds(actions) == ["stopentry"]
+
+
+def test_lock_leaves_a_paused_or_stopped_bot_alone(cfg: GuardConfig) -> None:
+    """/stopentry on a stopped bot restarts it in paused state; the guard must not undo an
+    operator's /stop or /pause. Unknown state counts as running."""
+    state = fresh_state(day_key="2026-09-15", day_start_equity=Decimal("800"), peak_equity=Decimal("1000"))
+    for bot_state in ("paused", "stopped"):
+        _, actions = evaluate(state, obs("700", lock_exists=True, bot_state=bot_state), cfg)
+        assert kinds(actions) == [], bot_state
+    for bot_state in ("running", None):
+        _, actions = evaluate(state, obs("700", lock_exists=True, bot_state=bot_state), cfg)
+        assert kinds(actions) == ["stopentry"], bot_state
+    # open trades are force-exited regardless of the bot state (the failure is alerted by the CLI)
+    _, actions = evaluate(state, obs("700", lock_exists=True, bot_state="stopped", open_trades=1), cfg)
+    assert kinds(actions) == ["forceexit", "alert", "event"]
+
+
+def test_prioritize_actions_puts_control_before_alerts() -> None:
+    actions = [
+        Action("stopentry", {"reason": "daily_loss"}),
+        Action("alert", {"title": "a"}),
+        Action("event", {"event": "daily_loss"}),
+        Action("forceexit", {"reason": "killswitch"}),
+        Action("write_lock", {}),
+        Action("alert", {"title": "b"}),
+        Action("event", {"event": "killswitch"}),
+        Action("cod_renew", {"seconds": 120}),
+    ]
+    ordered = guard.prioritize_actions(actions)
+    assert [a.kind for a in ordered] == [
+        "forceexit", "stopentry", "write_lock", "event", "event", "alert", "alert", "cod_renew"
+    ]
+    # stable: the relative order within a kind is kept
+    assert [a.details["title"] for a in ordered if a.kind == "alert"] == ["a", "b"]
+
+
+def test_lock_suspends_daily_loss_but_new_conditions_still_alert(cfg: GuardConfig) -> None:
+    # Day rollover under the lock: bookkeeping only, no daily-loss alert for the crash that caused it
+    state = fresh_state(day_key="2026-09-14", day_start_equity=Decimal("1000"), peak_equity=Decimal("1000"))
+    state, actions = evaluate(state, obs("700", lock_exists=True), cfg)
+    assert kinds(actions) == ["event", "stopentry"] and events(actions) == [guard.EVENT_DAY_START]
+    assert state.day_start_equity == Decimal("700") and state.daily_loss_day is None
+    # A reconciliation mismatch is a new condition: it alerts, but stopentry is still sent only once
+    state = replace(state, reconcile_mismatches=1)
+    live = _live_obs(T0 + timedelta(minutes=1), "700", "600", lock_exists=True)
+    state, actions = evaluate(state, live, cfg)
+    assert kinds(actions) == ["stopentry", "alert", "event"]
+    assert actions[0].details["reason"] == "killswitch_lock"
+    assert events(actions) == [guard.EVENT_RECONCILE_MISMATCH]
 
 
 def test_reset_state_clears_peak_so_it_does_not_retrigger(cfg: GuardConfig) -> None:
@@ -143,6 +219,46 @@ def test_reconcile_mismatch_needs_two_consecutive_runs(cfg: GuardConfig) -> None
     assert kinds(actions) == ["stopentry"]
 
 
+def test_reconcile_counter_survives_exchange_errors(cfg: GuardConfig) -> None:
+    """mismatch, exchange error, mismatch must reach the threshold: a run without exchange
+    data is neither a match nor a mismatch."""
+    state, _ = evaluate(fresh_state(), _live_obs(T0, "1000", "990"), cfg)
+    assert state.reconcile_mismatches == 1
+    broken = obs("1000", now=T0 + timedelta(minutes=1), dry_run=False, ft_eur="1000", ft_btc="0",
+                 exchange_error="RequestTimeout: bitvavo GET /balance")
+    state, actions = evaluate(state, broken, cfg)
+    assert state.reconcile_mismatches == 1 and "stopentry" not in kinds(actions)
+    state, actions = evaluate(state, _live_obs(T0 + timedelta(minutes=2), "1000", "990"), cfg)
+    assert state.reconcile_mismatches == 2
+    assert kinds(actions) == ["stopentry", "alert", "event"]
+    # dry-run resets the counter
+    state, _ = evaluate(state, obs("1000", now=T0 + timedelta(minutes=3), dry_run=True), cfg)
+    assert state.reconcile_mismatches == 0
+
+
+def test_exchange_failures_alert_after_three_runs_and_recover(cfg: GuardConfig) -> None:
+    state = fresh_state(day_key="2026-09-15", day_start_equity=Decimal("1000"), peak_equity=Decimal("1000"))
+    for i in range(1, 5):
+        broken = obs("1000", now=T0 + timedelta(minutes=i), dry_run=False, ft_eur="1000", ft_btc="0",
+                     exchange_error="AuthenticationError: invalid key")
+        state, actions = evaluate(state, broken, cfg)
+        assert state.exchange_failures == i
+        if i == 3:
+            assert kinds(actions) == ["event", "alert"]
+            assert events(actions) == [guard.EVENT_EXCHANGE_UNREACHABLE]
+            assert "invalid key" in actions[1].details["message"]
+        else:
+            assert kinds(actions) == []  # below threshold or rate-limited
+    # live run without RO key (no attempt): nothing counted, nothing reset
+    state, actions = evaluate(state, obs("1000", now=T0 + timedelta(minutes=5), dry_run=False), cfg)
+    assert state.exchange_failures == 4 and kinds(actions) == []
+    # exchange back: recovery event + info alert, counter reset, rate limit cleared
+    state, actions = evaluate(state, _live_obs(T0 + timedelta(minutes=6), "1000", "1000"), cfg)
+    assert state.exchange_failures == 0 and state.reconcile_mismatches == 0
+    assert events(actions) == [guard.EVENT_EXCHANGE_RECOVERED]
+    assert guard.EVENT_EXCHANGE_UNREACHABLE not in state.last_alerts
+
+
 def test_reconcile_values_btc_difference_with_price(cfg: GuardConfig) -> None:
     diff = guard.reconcile_diff_eur(
         Decimal("100"), Decimal("0.01"), Decimal("100"), Decimal("0.0099"), Decimal("50000")
@@ -178,7 +294,8 @@ def test_advisor_staleness_alert_rate_limited_to_6h() -> None:
     state, actions = evaluate(fresh_state(), obs("1000", advisor_created_at=fresh), cfg)
     assert guard.EVENT_ADVISOR_STALE not in events(actions)
 
-    state, actions = evaluate(state, obs("1000", now=T0 + timedelta(minutes=1), advisor_created_at=stale), cfg)
+    later = T0 + timedelta(minutes=1)
+    state, actions = evaluate(state, obs("1000", now=later, advisor_created_at=stale), cfg)
     assert events(actions) == [guard.EVENT_ADVISOR_STALE]
     assert sum(1 for a in actions if a.kind == "alert") == 1
     assert state.last_alerts[guard.EVENT_ADVISOR_STALE] == T0 + timedelta(minutes=1)
@@ -248,6 +365,7 @@ def test_state_round_trip_and_tolerant_parsing() -> None:
         peak_equity=Decimal("1200"),
         ft_failures=2,
         reconcile_mismatches=1,
+        exchange_failures=3,
         last_alerts={"advisor_stale": T0},
         last_equity=Decimal("990"),
         last_check=T0,
@@ -257,7 +375,10 @@ def test_state_round_trip_and_tolerant_parsing() -> None:
     data = state.to_dict()
     assert data["schema_version"] == 1
     assert data["day_start_equity"] == "1000.50"
-    assert data["last_alerts"] == {"advisor_stale": "2026-09-15T10:00:00Z"}
+    assert list(data["last_alerts"]) == ["advisor_stale"]
+    assert data["last_alerts"]["advisor_stale"].endswith("Z")
+    assert parse_iso(data["last_alerts"]["advisor_stale"]) == T0
+    assert data["exchange_failures"] == 3
     assert GuardState.from_dict(data) == state
     broken = GuardState.from_dict({"peak_equity": "abc", "ft_failures": "x", "last_alerts": "no"})
     assert broken == GuardState()

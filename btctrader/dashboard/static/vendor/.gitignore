@@ -1,0 +1,3 @@
+# chart.umd.js and htmx.min.js are downloaded here by fetch-vendor.sh (install.sh);
+# third-party minified builds are not committed. fetch-vendor.sh stays tracked.
+*.js

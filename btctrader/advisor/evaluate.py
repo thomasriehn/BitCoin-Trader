@@ -2,8 +2,12 @@
 
 For every successful line of ``decisions.jsonl`` the daily close on the
 decision date is joined with the close ``h`` days later for several
-horizons (1 d, 7 d and the model's own ``horizon_days``). A call counts as a
-hit when the forward return has the sign the regime implies:
+horizons (1 d, 7 d and the model's own ``horizon_days``). Forward returns
+are measured from the close of the decision day (UTC), not from the moment
+of the call: a decision made at 00:07 UTC is compared against the close
+that ends that same day. Only closed daily candles are used; the still
+open candle of today is dropped. A call counts as a hit when the forward
+return has the sign the regime implies:
 
 * ``risk_on``: forward return > 0
 * ``risk_off``: forward return < 0
@@ -18,6 +22,7 @@ outcome for anything that tries to predict short-term price direction.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -31,12 +36,21 @@ from btctrader.common import bitvavo_public
 from btctrader.common.bitvavo_public import Candle
 from btctrader.common.db import parse_iso
 
+log = logging.getLogger(__name__)
+
 NEUTRAL_BAND_PCT = 3.0
 FIXED_HORIZONS = (1, 7)
+MARKET = "BTC-EUR"
+DAY_MS = 86_400_000
+MAX_CANDLE_PAGES = 20  # 20 x 1440 days, far beyond the 10-year retention of decisions.jsonl
 
 
 def read_decisions(path: str | Path, *, since: date | None = None) -> list[dict[str, Any]]:
-    """All valid, error-free decision lines (oldest first), optionally from ``since`` on."""
+    """All valid, error-free decision lines (oldest first), optionally from ``since`` on.
+
+    ``raw_response`` (up to 4000 characters per line) is dropped while reading
+    so a ten-year file does not sit in memory just for three fields.
+    """
     p = Path(path)
     if not p.exists():
         return []
@@ -58,6 +72,7 @@ def read_decisions(path: str | Path, *, since: date | None = None) -> list[dict[
                 continue
             if since is not None and created.date() < since:
                 continue
+            obj.pop("raw_response", None)
             rows.append(obj)
     return rows
 
@@ -181,9 +196,37 @@ def format_table(ev: Evaluation) -> str:
 def fetch_candles_for(
     decisions: Sequence[dict[str, Any]], *, client: httpx.Client | None = None
 ) -> list[Candle]:
-    """Daily candles from a bit before the first decision until now (one API call)."""
+    """Closed daily candles from two days before the first decision until now.
+
+    Bitvavo answers ``start`` + ``limit`` with the newest ``limit`` candles at or
+    after ``start`` (checked live 16.09.2026), so one call covers at most 1440
+    days. The download therefore pages backwards with ``end`` until the first
+    decision date is covered. If the exchange has no candle that early, a
+    warning is logged and those decisions stay pending.
+    """
     if not decisions:
         return []
     first = min(parse_iso(str(d["created_at"])) for d in decisions)
-    start_ms = int(first.timestamp() * 1000) - 2 * 86_400_000
-    return bitvavo_public.fetch_candles("BTC-EUR", "1d", 1440, start_ms=start_ms, client=client)
+    start_ms = int(first.timestamp() * 1000) - 2 * DAY_MS
+    pages: list[list[Candle]] = []
+    end_ms: int | None = None
+    for _ in range(MAX_CANDLE_PAGES):
+        page = bitvavo_public.fetch_candles(
+            MARKET, "1d", bitvavo_public.MAX_CANDLE_LIMIT, start_ms=start_ms, end_ms=end_ms, client=client
+        )
+        if not page:
+            break
+        pages.append(page)
+        oldest = page[0].ts_ms
+        if oldest <= start_ms or len(page) < bitvavo_public.MAX_CANDLE_LIMIT:
+            break
+        end_ms = oldest - 1
+    merged = {c.ts_ms: c for page in pages for c in page}
+    candles = bitvavo_public.closed_only([merged[k] for k in sorted(merged)], "1d")
+    if candles and candles[0].ts_ms > int(first.timestamp() * 1000):
+        log.warning(
+            "oldest candle %s is later than the first decision %s; older decisions stay pending",
+            datetime.fromtimestamp(candles[0].ts_ms / 1000.0, tz=UTC).date().isoformat(),
+            first.date().isoformat(),
+        )
+    return candles

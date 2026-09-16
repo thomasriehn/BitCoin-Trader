@@ -101,3 +101,81 @@ def test_evaluate_empty() -> None:
     result = ev.evaluate_decisions([], [])
     assert result.rows == [] and result.decisions == 0
     assert "decisions: 0" in ev.format_table(result)
+
+
+def _daily_rows_ending_today(days: int) -> list[list[str | int]]:
+    """Bitvavo wire rows (newest first) for ``days`` daily candles, the newest being today's open one."""
+    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    rows: list[list[str | int]] = []
+    for i in range(days):
+        day = today - timedelta(days=days - 1 - i)
+        c = f"{100 + i * 0.01:.2f}"
+        rows.append([int(day.timestamp() * 1000), c, c, c, c, "1"])
+    return list(reversed(rows))
+
+
+def _bitvavo_like(rows: list[list[str | int]]) -> object:
+    """Mimic the live API: newest ``limit`` rows with start <= ts <= end (checked live 16.09.2026)."""
+    import httpx
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        limit = int(params["limit"])
+        start = int(params.get("start", 0))
+        end = int(params.get("end", 2**62))
+        selected = [r for r in rows if start <= int(r[0]) <= end]  # rows are newest first
+        return httpx.Response(200, json=selected[:limit])
+
+    return respond
+
+
+def test_fetch_candles_pages_backwards_and_drops_open_candle(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    import respx
+
+    from btctrader.common.bitvavo_public import BASE_URL
+
+    rows = _daily_rows_ending_today(3000)
+    first_day = datetime.fromtimestamp(int(rows[-1][0]) / 1000, tz=UTC).date()
+    first_decision = first_day + timedelta(days=100)
+    decisions = [_decision(first_decision, "risk_on"), _decision(first_day + timedelta(days=2900), "neutral")]
+    with respx.mock, caplog.at_level(logging.WARNING):
+        route = respx.get(f"{BASE_URL}/BTC-EUR/candles").mock(side_effect=_bitvavo_like(rows))
+        candles = ev.fetch_candles_for(decisions)
+    # about 2900 days are needed: three pages of at most 1440, each one ending before the previous one
+    assert route.call_count == 3
+    params = [c.request.url.params for c in route.calls]
+    assert "end" not in params[0] and all(p["limit"] == "1440" for p in params)
+    assert int(params[2]["end"]) < int(params[1]["end"])
+    days = [datetime.fromtimestamp(c.ts_ms / 1000, tz=UTC).date() for c in candles]
+    assert days == sorted(set(days)), "ascending, no duplicates"
+    assert days[0] == first_decision - timedelta(days=1)
+    assert days[-1] == datetime.now(UTC).date() - timedelta(days=1), "today's open candle is dropped"
+    assert not [r for r in caplog.records if "stay pending" in r.getMessage()]
+    result = ev.evaluate_decisions(decisions, candles)
+    assert result.pending == 0
+
+
+def test_fetch_candles_warns_when_history_is_too_short(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    import respx
+
+    from btctrader.common.bitvavo_public import BASE_URL
+
+    rows = _daily_rows_ending_today(30)
+    decisions = [_decision(date(2019, 1, 1), "risk_on")]
+    with respx.mock, caplog.at_level(logging.WARNING):
+        respx.get(f"{BASE_URL}/BTC-EUR/candles").mock(side_effect=_bitvavo_like(rows))
+        candles = ev.fetch_candles_for(decisions)
+    assert len(candles) == 29
+    assert any("2019-01-01" in r.getMessage() and "stay pending" in r.getMessage() for r in caplog.records)
+    assert ev.evaluate_decisions(decisions, candles).pending == 1
+
+
+def test_read_decisions_drops_raw_response(tmp_path: Path) -> None:
+    log_path = tmp_path / "decisions.jsonl"
+    log_path.write_text(json.dumps(_decision(date(2026, 9, 1), "risk_on", raw_response="x" * 4000)) + "\n")
+    rows = ev.read_decisions(log_path)
+    assert len(rows) == 1 and "raw_response" not in rows[0] and rows[0]["regime"] == "risk_on"

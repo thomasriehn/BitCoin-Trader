@@ -1,0 +1,12 @@
+[Unit]
+Description=Run btctrader-guard check every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=5s
+RandomizedDelaySec=5
+Persistent=true
+Unit=btctrader-guard.service
+
+[Install]
+WantedBy=timers.target

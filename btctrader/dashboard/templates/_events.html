@@ -1,0 +1,14 @@
+{% if events %}
+<ul class="events">
+{% for e in events %}
+  {% set name = e.event or "?" %}
+  <li class="event event-{{ name }}">
+    <time datetime="{{ e.ts }}">{{ e.ts | local_ts("%d.%m. %H:%M") }}</time>
+    <span class="event-name {% if name in ('killswitch', 'daily_loss', 'reconcile_mismatch') %}status status-critical{% elif name in ('ft_unreachable', 'advisor_stale') %}status status-warn{% endif %}">{{ name }}</span>
+    <span class="event-details muted">{% if e.details is mapping %}{% for k, v in e.details.items() %}{{ k }}={{ v }}{% if not loop.last %} · {% endif %}{% endfor %}{% elif e.details %}{{ e.details }}{% endif %}</span>
+  </li>
+{% endfor %}
+</ul>
+{% else %}
+<p class="muted empty">Keine Ereignisse.</p>
+{% endif %}

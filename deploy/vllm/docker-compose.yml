@@ -17,6 +17,8 @@ services:
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
       HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      # vLLM reads the key from this variable itself (vllm/envs.py). Not passed as --api-key on
+      # purpose: the command line is visible in `ps aux` on the host and in `docker inspect`.
       VLLM_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY in .env}
     volumes:
       - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
@@ -29,8 +31,6 @@ services:
       - ${VLLM_SERVED_NAME:-advisor}
       - --max-model-len
       - "${VLLM_MAX_MODEL_LEN:-8192}"
-      - --api-key
-      - ${VLLM_API_KEY}
       - --seed
       - "${VLLM_SEED:-42}"
       - --gpu-memory-utilization

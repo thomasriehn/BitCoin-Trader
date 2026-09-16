@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -255,3 +257,77 @@ def test_no_authorization_header_without_api_key(settings: Settings, context: di
         )
         assert advisor.run_advisor(s, context=context, system_prompt="SYS", now=NOW).exit_code == 0
     assert "Authorization" not in route.calls[0].request.headers
+
+
+def test_production_timestamps_have_whole_seconds(settings: Settings, context: dict[str, Any]) -> None:
+    """Section 6 shows ``2026-09-15T13:07:02Z``; a run without ``now`` must not leak microseconds."""
+    with respx.mock:
+        respx.post(URL).mock(return_value=httpx.Response(200, json=chat_response(json.dumps(good_answer()))))
+        outcome = advisor.run_advisor(settings, context=context, system_prompt="SYS")
+    assert outcome.exit_code == 0 and outcome.decision is not None
+    stamp = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
+    assert re.fullmatch(stamp, outcome.decision["created_at"])
+    assert re.fullmatch(stamp, outcome.decision["valid_until"])
+    assert re.fullmatch(stamp + r"-[0-9a-f]{6}", outcome.decision["decision_id"])
+
+
+def _failing_replace_for(name: str) -> Any:
+    """``os.replace`` stand-in that fails only for destination ``name`` (after the tmp file exists)."""
+    real_replace = os.replace
+
+    def fake(src: Any, dst: Any) -> None:
+        if Path(dst).name == name:
+            assert Path(src).exists() and Path(src).name.startswith(f".{name}.")
+            raise OSError(28, "No space left on device")
+        real_replace(src, dst)
+
+    return fake
+
+
+@respx.mock
+def test_failed_decision_replace_keeps_old_file_and_logs_error(
+    settings: Settings, context: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 11 'atomares Schreiben': the rename fails -> old decision.json intact, log line says so."""
+    old = _seed_existing_decision(settings)
+    respx.post(URL).mock(return_value=httpx.Response(200, json=chat_response(json.dumps(good_answer()))))
+    monkeypatch.setattr("btctrader.common.jsonl.os.replace", _failing_replace_for(advisor.DECISION_FILE))
+    outcome = advisor.run_advisor(settings, context=context, system_prompt="SYS", now=NOW)
+    assert outcome.exit_code == 1 and outcome.decision is None
+    assert "cannot write decision.json" in (outcome.error or "")
+    decision_file, log_file, _ = _files(settings)
+    assert read_json(decision_file) == old
+    assert [p.name for p in decision_file.parent.iterdir() if p.name.endswith(".tmp")] == []
+    line = read_jsonl_tail(log_file)[0]
+    assert line["error"] and "No space left" in line["error"]
+    assert line["regime"] == "neutral"  # what the model said is kept, but the line is not a success
+
+
+@respx.mock
+def test_failed_log_append_after_decision_written_is_reported(
+    settings: Settings, context: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.post(URL).mock(return_value=httpx.Response(200, json=chat_response(json.dumps(good_answer()))))
+
+    def boom(path: Any, obj: Any) -> None:
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(advisor, "append_jsonl", boom)
+    outcome = advisor.run_advisor(settings, context=context, system_prompt="SYS", now=NOW)
+    assert outcome.exit_code == 1
+    assert "decision.json written" in (outcome.error or "")
+    doc = read_json(_files(settings)[0])
+    assert doc is not None and doc["regime"] == "neutral"
+    assert not _files(settings)[1].exists()
+
+
+@respx.mock
+def test_truncated_answer_names_max_tokens(settings: Settings, context: dict[str, Any]) -> None:
+    body = chat_response('{"regime": "neutral", "confidence": 0.5, "rationale": "cut off he')
+    body["choices"][0]["finish_reason"] = "length"
+    respx.post(URL).mock(return_value=httpx.Response(200, json=body))
+    outcome = advisor.run_advisor(settings, context=context, system_prompt="SYS", now=NOW)
+    assert outcome.exit_code == 1
+    error = outcome.error or ""
+    assert "truncated at max_tokens=400" in error and "not valid JSON" in error
+    assert not _files(settings)[0].exists()

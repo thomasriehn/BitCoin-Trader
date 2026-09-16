@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -54,6 +57,50 @@ def test_deleting_a_row_breaks_the_link(ledger_conn: sqlite3.Connection) -> None
         ledger_conn.execute("DELETE FROM fills WHERE exchange_trade_id = 't2'")
     problems = verify_chain(ledger_conn, ACCOUNT)
     assert any("t3" in p and "prev_hash" in p for p in problems)
+
+
+def test_deleting_the_newest_row_is_detected(ledger_conn: sqlite3.Connection) -> None:
+    """Dropping the tail leaves a valid link chain; the sync_state anchor still catches it."""
+    fills = _three_fills()
+    upsert_fills(ledger_conn, fills)
+    with ledger_conn:
+        ledger_conn.execute("DELETE FROM fills WHERE exchange_trade_id = 't3'")
+    problems = verify_chain(ledger_conn, ACCOUNT)
+    assert len(problems) == 1 and "chain tail mismatch" in problems[0] and "3 rows" in problems[0]
+    # A later sync must not quietly re-append the deleted fill with a fresh link.
+    with pytest.raises(ChainError, match="chain tail mismatch"):
+        upsert_fills(ledger_conn, fills)
+    assert ledger_conn.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 2
+
+
+def test_concurrent_upserts_serialise_on_the_write_lock(
+    ledger_conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """A second writer must wait for the first instead of chaining onto a stale prev_hash."""
+    path = tmp_path / "ledger.sqlite"
+    other = sqlite3.connect(path, timeout=30.0, isolation_level="DEFERRED", check_same_thread=False)
+    other.row_factory = sqlite3.Row
+    errors: list[BaseException] = []
+
+    def late_writer() -> None:
+        try:
+            upsert_fills(other, [make_fill("late", "2026-01-02", "buy", "0.1", "50000")])
+        except BaseException as exc:  # noqa: BLE001 - surfaced via the assertion below
+            errors.append(exc)
+
+    ledger_conn.execute("BEGIN IMMEDIATE")  # hold the write lock while the other sync starts
+    thread = threading.Thread(target=late_writer)
+    thread.start()
+    time.sleep(0.5)
+    assert thread.is_alive()  # blocked on BEGIN IMMEDIATE, has not read the chain yet
+    upsert_fills(ledger_conn, [make_fill("early", "2026-01-01", "buy", "0.1", "50000")])  # commits, unlocks
+    thread.join(timeout=30)
+    other.close()
+    assert not thread.is_alive() and errors == []
+    rows = load_fills(ledger_conn, ACCOUNT)
+    assert [r.exchange_trade_id for r in rows] == ["early", "late"]
+    assert rows[1].prev_hash == rows[0].row_hash
+    assert verify_chain(ledger_conn, ACCOUNT) == []
 
 
 def test_rewriting_hash_without_prev_link_is_detected(ledger_conn: sqlite3.Connection) -> None:

@@ -1,0 +1,27 @@
+# One advisor run: market context from the public Bitvavo API -> local vLLM -> decision.json.
+# Started by btctrader-advisor.timer (hourly at minute 7). No exchange keys in this process.
+[Unit]
+Description=btctrader advisor run (local vLLM regime signal)
+Documentation=file:///srv/trading/repo/docs/VLLM_ADVISOR.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=freqtrade
+Group=freqtrade
+UMask=0027
+WorkingDirectory=/srv/trading
+EnvironmentFile=/etc/freqtrade/btctrader.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/srv/trading/venv/bin/btctrader-advisor run
+# ADVISOR_TIMEOUT_S defaults to 120 s; leave headroom for context download and retries.
+TimeoutStartSec=10min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/trading/advisor
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true

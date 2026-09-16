@@ -1,0 +1,51 @@
+# Freqtrade dry-run bot (Phase 2): simulated orders against live Bitvavo market data.
+# Config: user_data/config.json (copy from the repo, dry_run true) + config-private.json (0600).
+# Secrets: /etc/freqtrade/secrets-dryrun.env (View-only key). Never point this unit at secrets.env.
+# Hardening notes: options that need /proc bind mounts (ProtectKernelTunables, ProtectKernelLogs,
+# ProtectClock, PrivateDevices, SystemCallFilter) fail inside unprivileged LXC and are left out.
+[Unit]
+Description=Freqtrade BTC/EUR bot (dry-run)
+Documentation=file:///srv/trading/repo/docs/BETRIEB.md
+After=network-online.target
+Wants=network-online.target
+# No start rate limit: with the old 5 starts per minute (RestartSec=10) a fast failure loop after a power
+# outage (DNS or api.bitvavo.com not reachable yet, Freqtrade exits with code 2) would leave
+# the unit in "failed" and Restart=always would stop trying. Restart=always plus RestartSec
+# keeps retrying; a real config error loops until you run: systemctl stop <unit>.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=freqtrade
+Group=freqtrade
+UMask=0027
+WorkingDirectory=/srv/trading
+EnvironmentFile=/etc/freqtrade/btctrader.env
+EnvironmentFile=/etc/freqtrade/secrets-dryrun.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/freqtrade/venv/bin/freqtrade trade \
+  --userdir /srv/trading/user_data \
+  --config /srv/trading/user_data/config.json \
+  --config /srv/trading/user_data/config-private.json \
+  --strategy BtcTrend \
+  --db-url sqlite:////srv/trading/user_data/tradesv3.dryrun.sqlite \
+  --logfile /srv/trading/user_data/logs/freqtrade-dryrun.log \
+  --sd-notify
+Restart=always
+RestartSec=10
+TimeoutStartSec=2min
+TimeoutStopSec=90
+# at least 2 x internals.process_throttle_secs (5 s in config.json)
+WatchdogSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/trading
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

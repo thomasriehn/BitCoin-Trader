@@ -1,8 +1,15 @@
 """Market context for the advisor, built only from the public Bitvavo API.
 
-No API keys, no news, no external feeds. Optionally the Freqtrade REST API
-is asked for the bot status (position yes/no, unrealised profit); if that
-fails the context still gets built and ``bot.available`` is ``false``.
+No API keys, no news, no external feeds. Optionally a ``status`` callable
+(the ``status()`` method of the Freqtrade REST client, nothing more) is asked
+for the bot status (position yes/no, unrealised profit); if that fails the
+context still gets built and ``bot.available`` is ``false``.
+
+Bitvavo returns the still open candle of the current interval as the newest
+row. All indicators (SMA, volatility, returns, drawdown, volume trend) and the
+``candles_1d`` / ``candles_4h`` rows use closed candles only, exactly like the
+strategy (``process_only_new_candles``). The open daily candle is reported
+separately as ``open_candle_1d`` and its close is the live ``price_eur``.
 
 The context is a plain ``dict`` of JSON-native values so it can be
 serialised deterministically (sorted keys, compact separators) and hashed.
@@ -14,17 +21,17 @@ import hashlib
 import json
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import httpx
 
 from btctrader.common import bitvavo_public
 from btctrader.common.bitvavo_public import BitvavoError, Candle
-from btctrader.common.db import iso_utc, utcnow
-from btctrader.common.ftapi import FreqtradeClient, FreqtradeError
+from btctrader.common.db import utcnow
+from btctrader.common.ftapi import FreqtradeError
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +48,17 @@ HIGH_LOOKBACK_DAYS = 365
 VOLUME_SHORT_DAYS = 7
 VOLUME_LONG_DAYS = 30
 VOLUME_TREND_BAND = 0.15  # +-15 % ratio counts as flat
+VOLUME_DECIMALS = Decimal("0.01")  # candle volumes are rounded to 2 decimals to save prompt tokens
+
+StatusFn = Callable[[], Any]
+"""Read-only callable returning the Freqtrade ``/status`` list (open trades)."""
+
+
+def iso_seconds(dt: datetime) -> str:
+    """ISO-8601 UTC with ``Z`` and whole seconds (``2026-09-15T13:07:02Z``), the format of section 6."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).replace(microsecond=0).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def stable_json(obj: Any) -> str:
@@ -52,7 +70,7 @@ def _json_default(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, datetime):
-        return iso_utc(value)
+        return iso_seconds(value)
     raise TypeError(f"not JSON serialisable: {type(value).__name__}")
 
 
@@ -149,44 +167,68 @@ def volume_trend(candles: Sequence[Candle], short: int, long: int) -> tuple[floa
     return ratio, label
 
 
+def _candle_row(c: Candle, *, date_only: bool) -> dict[str, Any]:
+    ts = datetime.fromtimestamp(c.ts_ms / 1000.0, tz=UTC)
+    return {
+        "t": ts.date().isoformat() if date_only else iso_seconds(ts),
+        "o": str(c.open),
+        "h": str(c.high),
+        "l": str(c.low),
+        "c": str(c.close),
+        "v": str(c.volume.quantize(VOLUME_DECIMALS, rounding=ROUND_HALF_UP)),
+    }
+
+
 def _candle_rows(candles: Sequence[Candle], *, date_only: bool) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for c in candles:
-        ts = datetime.fromtimestamp(c.ts_ms / 1000.0, tz=UTC)
-        rows.append(
-            {
-                "t": ts.date().isoformat() if date_only else iso_utc(ts),
-                "o": str(c.open),
-                "h": str(c.high),
-                "l": str(c.low),
-                "c": str(c.close),
-                "v": str(c.volume),
-            }
-        )
-    return rows
+    return [_candle_row(c, date_only=date_only) for c in candles]
+
+
+def split_open_candle(
+    candles: Sequence[Candle], interval: str, now: datetime
+) -> tuple[list[Candle], Candle | None]:
+    """``(closed candles, open candle or None)``; the open candle is the one whose interval has not ended."""
+    now_ms = int(now.timestamp() * 1000)
+    closed = bitvavo_public.closed_only(candles, interval, now_ms)
+    still_open = [c for c in candles if not bitvavo_public.is_closed(c, interval, now_ms)]
+    return closed, (still_open[-1] if still_open else None)
 
 
 # -- market part ---------------------------------------------------------------------
 
 
-def market_features(daily: Sequence[Candle], fourhour: Sequence[Candle]) -> dict[str, Any]:
-    """Compute all indicator fields from candle lists (ascending by time). Pure function."""
-    if not daily:
-        raise ValueError("no daily candles")
-    closes = _closes(daily)
+def market_features(
+    daily: Sequence[Candle], fourhour: Sequence[Candle], *, now: datetime | None = None
+) -> dict[str, Any]:
+    """Compute all indicator fields from candle lists (ascending by time).
+
+    Indicators and candle rows are computed on closed candles only (as of
+    ``now``, default: current time); the open daily candle, if present, is
+    reported as ``open_candle_1d`` and provides the live ``price_eur``. This
+    keeps ``volume_trend`` and ``dist_sma200_pct`` stable within a day and
+    identical to what the daily strategy sees.
+    """
+    ts_now = now or utcnow()
+    closed_daily, open_daily = split_open_candle(daily, "1d", ts_now)
+    closed_4h, _ = split_open_candle(fourhour, "4h", ts_now)
+    if not closed_daily:
+        raise ValueError("no closed daily candles")
+    closes = _closes(closed_daily)
     last_close = closes[-1]
+    live = open_daily.close if open_daily is not None else closed_daily[-1].close
     sma50 = sma(closes, SMA_SHORT)
     sma200 = sma(closes, SMA_LONG)
-    high_365, dd = drawdown_from_high(daily, HIGH_LOOKBACK_DAYS)
-    vol_ratio, vol_label = volume_trend(daily, VOLUME_SHORT_DAYS, VOLUME_LONG_DAYS)
-    last_ts = datetime.fromtimestamp(daily[-1].ts_ms / 1000.0, tz=UTC)
+    high_365, dd = drawdown_from_high(closed_daily, HIGH_LOOKBACK_DAYS)
+    vol_ratio, vol_label = volume_trend(closed_daily, VOLUME_SHORT_DAYS, VOLUME_LONG_DAYS)
+    last_ts = datetime.fromtimestamp(closed_daily[-1].ts_ms / 1000.0, tz=UTC)
     return {
         "market": MARKET,
-        "price_eur": str(daily[-1].close),
+        "price_eur": str(live),
+        "last_close_eur": str(closed_daily[-1].close),
         "last_daily_candle": last_ts.date().isoformat(),
-        "daily_candles_available": len(daily),
-        "candles_1d": _candle_rows(daily[-DAILY_CANDLES_IN_CONTEXT:], date_only=True),
-        "candles_4h": _candle_rows(fourhour[-FOURHOUR_CANDLES_IN_CONTEXT:], date_only=False),
+        "daily_candles_available": len(closed_daily),
+        "candles_1d": _candle_rows(closed_daily[-DAILY_CANDLES_IN_CONTEXT:], date_only=True),
+        "open_candle_1d": _candle_row(open_daily, date_only=True) if open_daily is not None else None,
+        "candles_4h": _candle_rows(closed_4h[-FOURHOUR_CANDLES_IN_CONTEXT:], date_only=False),
         "sma50_eur": _round(sma50, 2),
         "sma200_eur": _round(sma200, 2),
         "dist_sma50_pct": _round(pct_distance(last_close, sma50)),
@@ -201,9 +243,10 @@ def market_features(daily: Sequence[Candle], fourhour: Sequence[Candle]) -> dict
 
 
 def fetch_market(client: httpx.Client | None = None) -> tuple[list[Candle], list[Candle]]:
-    """Fetch the daily and 4h candle series from the public Bitvavo API."""
+    """Fetch the daily and 4h candle series from the public Bitvavo API (newest row is still open)."""
     daily = bitvavo_public.fetch_candles(MARKET, "1d", DAILY_CANDLES_TO_FETCH, client=client)
-    fourhour = bitvavo_public.fetch_candles(MARKET, "4h", FOURHOUR_CANDLES_IN_CONTEXT, client=client)
+    # one extra 4h candle so that 24 closed ones remain after the open one is set aside
+    fourhour = bitvavo_public.fetch_candles(MARKET, "4h", FOURHOUR_CANDLES_IN_CONTEXT + 1, client=client)
     if len(daily) < 2:
         raise BitvavoError("too few daily candles returned")
     return daily, fourhour
@@ -212,15 +255,21 @@ def fetch_market(client: httpx.Client | None = None) -> tuple[list[Candle], list
 # -- bot part ------------------------------------------------------------------------
 
 
-def bot_status(ft: FreqtradeClient | None) -> dict[str, Any]:
-    """Position summary from the Freqtrade API; never raises, reports ``available: false`` instead."""
-    if ft is None:
+def bot_status(status: StatusFn | None) -> dict[str, Any]:
+    """Position summary via the read-only ``status`` callable; never raises, reports ``available: false``.
+
+    Only ``FreqtradeClient.status`` is handed in, not the client, so this
+    module cannot reach any control endpoint of the bot (section 6).
+    """
+    if status is None:
         return {"available": False, "reason": "not configured"}
     try:
-        trades = ft.status()
+        trades = status()
     except (FreqtradeError, httpx.HTTPError) as exc:
         log.warning("freqtrade status unavailable, continuing without bot context: %s", exc)
         return {"available": False, "reason": str(exc)[:200]}
+    if not isinstance(trades, list):
+        return {"available": False, "reason": "unexpected status payload"}
     open_trades = [t for t in trades if isinstance(t, dict) and t.get("is_open") is not False]
     profit_pct = [float(t["profit_pct"]) for t in open_trades if t.get("profit_pct") is not None]
     profit_abs = [float(t["profit_abs"]) for t in open_trades if t.get("profit_abs") is not None]
@@ -241,12 +290,12 @@ def bot_status(ft: FreqtradeClient | None) -> dict[str, Any]:
 def build_context(
     *,
     client: httpx.Client | None = None,
-    ft: FreqtradeClient | None = None,
+    status: StatusFn | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Fetch candles, compute features, optionally add bot status; returns a JSON-native dict."""
     daily, fourhour = fetch_market(client)
-    return assemble_context(daily, fourhour, bot=bot_status(ft), now=now)
+    return assemble_context(daily, fourhour, bot=bot_status(status), now=now)
 
 
 def assemble_context(
@@ -256,11 +305,11 @@ def assemble_context(
     bot: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Build the context dict from already fetched candles (used by tests and evaluate)."""
+    """Build the context dict from already fetched candles (``now`` decides which candles are closed)."""
     ts = now or utcnow()
     return {
         "schema_version": CONTEXT_SCHEMA_VERSION,
-        "as_of": iso_utc(ts),
-        "market": market_features(daily, fourhour),
+        "as_of": iso_seconds(ts),
+        "market": market_features(daily, fourhour, now=ts),
         "bot": bot if bot is not None else {"available": False, "reason": "not configured"},
     }

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -21,8 +23,15 @@ def test_market_features_shape(context: dict[str, Any]) -> None:
     assert m["market"] == "BTC-EUR"
     assert len(m["candles_1d"]) == 30
     assert len(m["candles_4h"]) == 24
-    assert m["candles_1d"][-1]["t"] == "2026-09-15"
-    assert m["candles_4h"][-1]["t"].endswith("Z")
+    # NOW is 13:07 on 2026-09-15: that day's candle is still open and kept out of the closed rows
+    assert m["candles_1d"][-1]["t"] == "2026-09-14"
+    assert m["last_daily_candle"] == "2026-09-14"
+    assert m["daily_candles_available"] == 399
+    assert m["open_candle_1d"]["t"] == "2026-09-15"
+    assert m["price_eur"] == m["open_candle_1d"]["c"]
+    assert m["last_close_eur"] == m["candles_1d"][-1]["c"]
+    assert m["candles_4h"][-1]["t"] == "2026-09-15T08:00:00Z"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", m["candles_4h"][-1]["t"])
     assert m["sma50_eur"] is not None and m["sma200_eur"] is not None
     assert set(m["returns_pct"]) == {"1d", "7d", "30d", "90d"}
     assert m["drawdown_from_365d_high_pct"] <= 0
@@ -60,11 +69,67 @@ def test_drawdown_and_volume_trend() -> None:
 
 def test_insufficient_history_yields_nulls() -> None:
     daily = make_daily_candles(10)
-    m = ctx_mod.market_features(daily, make_4h_candles(3))
+    m = ctx_mod.market_features(daily, make_4h_candles(3), now=NOW)
     assert m["sma200_eur"] is None and m["dist_sma200_pct"] is None
     assert m["returns_pct"]["90d"] is None
     assert m["realized_vol_30d_annualised_pct"] is None
-    assert len(m["candles_1d"]) == 10 and len(m["candles_4h"]) == 3
+    assert len(m["candles_1d"]) == 9 and len(m["candles_4h"]) == 2
+
+
+def _with_tiny_open_candle(closed: list[Candle]) -> tuple[list[Candle], datetime]:
+    """Append today's open candle holding seven minutes of volume; returns (candles, now at 00:07 UTC)."""
+    last = closed[-1]
+    ts_open = last.ts_ms + 86_400_000
+    close = last.close
+    open_candle = Candle(ts_open, close, close + 100, close - 100, close + 80, Decimal("3.4"))
+    now = datetime.fromtimestamp(ts_open / 1000.0, tz=UTC) + timedelta(minutes=7)
+    return [*closed, open_candle], now
+
+
+def test_open_daily_candle_does_not_change_indicators() -> None:
+    """Section 6 / finding: the still open candle must not drag volume_trend towards 'falling'."""
+    closed = make_daily_candles(400, end=NOW - timedelta(days=1))
+    after_close = datetime(2026, 9, 15, 0, 0, tzinfo=UTC)
+    base = ctx_mod.market_features(closed, [], now=after_close)
+    assert base["open_candle_1d"] is None and base["price_eur"] == base["last_close_eur"]
+
+    candles, now = _with_tiny_open_candle(closed)
+    m = ctx_mod.market_features(candles, [], now=now)
+    for key in (
+        "volume_trend",
+        "volume_ratio_7d_vs_30d",
+        "sma50_eur",
+        "sma200_eur",
+        "dist_sma200_pct",
+        "dist_sma50_pct",
+        "realized_vol_30d_annualised_pct",
+        "returns_pct",
+        "high_365d_eur",
+        "drawdown_from_365d_high_pct",
+        "candles_1d",
+        "last_daily_candle",
+        "last_close_eur",
+        "daily_candles_available",
+    ):
+        assert m[key] == base[key], key
+    assert m["open_candle_1d"]["t"] == "2026-09-15" and m["open_candle_1d"]["v"] == "3.40"
+    assert m["price_eur"] == str(candles[-1].close)
+    # the naive computation (all candles) would have flipped the label on identical closed data
+    naive_ratio, _ = ctx_mod.volume_trend(candles, 7, 30)
+    assert naive_ratio < m["volume_ratio_7d_vs_30d"]
+
+
+def test_candle_volume_is_rounded_to_two_decimals() -> None:
+    c = Candle(0, Decimal("1"), Decimal("2"), Decimal("0.5"), Decimal("1.5"), Decimal("1185.46661314"))
+    assert ctx_mod._candle_rows([c], date_only=True)[0]["v"] == "1185.47"
+
+
+def test_iso_seconds_drops_microseconds() -> None:
+    dt = datetime(2026, 9, 15, 23, 30, 51, 703852, tzinfo=UTC)
+    assert ctx_mod.iso_seconds(dt) == "2026-09-15T23:30:51Z"
+    assert ctx_mod.assemble_context(make_daily_candles(), make_4h_candles(), now=dt)["as_of"] == (
+        "2026-09-15T23:30:51Z"
+    )
 
 
 def test_context_hash_is_stable_across_key_order_and_runs(context: dict[str, Any]) -> None:
@@ -91,7 +156,7 @@ def test_stable_json_handles_decimal_and_is_compact() -> None:
 @respx.mock
 def test_build_context_fetches_bitvavo_and_skips_unreachable_bot() -> None:
     daily = make_daily_candles(400)
-    fourhour = make_4h_candles(24)
+    fourhour = make_4h_candles(25)
     route_1d = respx.get(f"{BASE_URL}/BTC-EUR/candles", params__contains={"interval": "1d"}).mock(
         return_value=httpx.Response(200, json=candles_to_api_rows(daily))
     )
@@ -100,10 +165,13 @@ def test_build_context_fetches_bitvavo_and_skips_unreachable_bot() -> None:
     )
     respx.post("http://ft.test/api/v1/token/login").mock(side_effect=httpx.ConnectError("down"))
     ft = FreqtradeClient("http://ft.test", "u", "p")
-    ctx = ctx_mod.build_context(ft=ft, now=NOW)
+    ctx = ctx_mod.build_context(status=ft.status, now=NOW)
     assert route_1d.called and route_4h.called
     assert route_1d.calls[0].request.url.params["limit"] == "400"
-    assert ctx["market"]["candles_1d"][-1]["c"] == str(daily[-1].close)
+    assert route_4h.calls[0].request.url.params["limit"] == "25"
+    assert ctx["market"]["open_candle_1d"]["c"] == str(daily[-1].close)
+    assert ctx["market"]["candles_1d"][-1]["c"] == str(daily[-2].close)
+    assert len(ctx["market"]["candles_4h"]) == 24
     assert ctx["bot"]["available"] is False
     assert "down" in ctx["bot"]["reason"] or "failed" in ctx["bot"]["reason"]
 
@@ -127,7 +195,7 @@ def test_bot_status_with_open_trade() -> None:
             ],
         )
     )
-    bot = ctx_mod.bot_status(FreqtradeClient("http://ft.test", "u", "p"))
+    bot = ctx_mod.bot_status(FreqtradeClient("http://ft.test", "u", "p").status)
     assert bot == {
         "available": True,
         "in_position": True,
@@ -144,5 +212,5 @@ def test_bot_status_without_position() -> None:
         return_value=httpx.Response(200, json={"access_token": "t", "refresh_token": "r"})
     )
     respx.get("http://ft.test/api/v1/status").mock(return_value=httpx.Response(200, json=[]))
-    bot = ctx_mod.bot_status(FreqtradeClient("http://ft.test", "u", "p"))
+    bot = ctx_mod.bot_status(FreqtradeClient("http://ft.test", "u", "p").status)
     assert bot["available"] is True and bot["in_position"] is False and bot["open_trades"] == 0

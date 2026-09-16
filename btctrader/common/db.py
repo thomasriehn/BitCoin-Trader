@@ -1,8 +1,10 @@
 """SQLite access for the ledger database and UTC time helpers.
 
 The schema mirrors docs/KOMPONENTEN.md section 5 exactly (plus indexes).
-Only ``btctrader.ledger`` writes to this database; other components open it
-read-only through the same ``connect`` helper.
+Only ``btctrader.ledger`` writes to this database and therefore uses
+``connect`` (creates the file, applies the schema, enables WAL). Every other
+component (dashboard, guard) opens it with ``connect_readonly``, which never
+creates a file and runs no DDL or PRAGMA.
 """
 
 from __future__ import annotations
@@ -107,12 +109,15 @@ TABLES: tuple[str, ...] = (
 )
 
 
-def connect(path: str | Path) -> sqlite3.Connection:
-    """Open (and create) the ledger database.
+def connect(path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
+    """Open (and create) the ledger database; ``readonly=True`` delegates to ``connect_readonly``.
 
     Creates the parent directory, enables WAL and foreign keys, sets
     ``sqlite3.Row`` as row factory and applies ``SCHEMA_SQL`` (idempotent).
+    Only the ledger component should call this without ``readonly``.
     """
+    if readonly:
+        return connect_readonly(path)
     p = Path(path)
     if str(p) != ":memory:":
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -126,21 +131,41 @@ def connect(path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+def connect_readonly(path: str | Path) -> sqlite3.Connection:
+    """Open an existing ledger database read-only (``mode=ro``), for dashboard and guard.
+
+    Never creates the file or its parent directory, applies no schema and no
+    PRAGMA (the journal mode is stored in the file). Raises ``FileNotFoundError``
+    when the database does not exist so a wrong ``LEDGER_DB_PATH`` fails clearly
+    instead of yielding an empty ledger.
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"ledger database {p} does not exist")
+    uri = f"file:{p.resolve().as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=30.0, isolation_level="DEFERRED")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def utcnow() -> datetime:
     """Current time as an aware UTC datetime."""
     return datetime.now(UTC)
 
 
 def iso_utc(dt: datetime) -> str:
-    """Format an aware datetime as ISO-8601 UTC with ``Z`` suffix.
+    """Format an aware datetime as ISO-8601 UTC with ``Z`` suffix and fixed precision.
 
-    Naive datetimes are treated as UTC. Microseconds are kept only when non-zero.
+    Naive datetimes are treated as UTC. The fraction of a second is always
+    written with six digits (``2026-09-15T13:07:02.000000Z``) so that the
+    lexicographic order of the strings is chronological. A variable precision
+    would break this: ``"...:02Z"`` sorts after ``"...:02.123000Z"`` because
+    ``"."`` < ``"Z"``, and the ledger orders fills and lots by these strings.
     """
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     dt = dt.astimezone(UTC)
-    timespec = "seconds" if dt.microsecond == 0 else "microseconds"
-    return dt.isoformat(timespec=timespec).replace("+00:00", "Z")
+    return dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def parse_iso(s: str) -> datetime:
