@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>BTC-Bot Übersicht</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script>
+    // Vendor scripts come from static/vendor/ (fetched by install.sh). If a file is missing,
+    // the onerror handler loads the pinned jsDelivr build with its SRI hash instead.
+    window.__vendorFallback = function (url, sri) {
+      var s = document.createElement("script");
+      s.src = url;
+      s.integrity = sri;
+      s.crossOrigin = "anonymous";
+      s.onload = function () { document.dispatchEvent(new CustomEvent("vendor-loaded", { detail: url })); };
+      s.onerror = function () { document.dispatchEvent(new CustomEvent("vendor-failed", { detail: url })); };
+      document.head.appendChild(s);
+    };
+  </script>
+  <script src="/static/vendor/htmx.min.js"
+          onerror="window.__vendorFallback('{{ htmx_cdn }}', '{{ htmx_sri }}')"></script>
+  <script src="/static/vendor/chart.umd.js"
+          onerror="window.__vendorFallback('{{ chartjs_cdn }}', '{{ chartjs_sri }}')"></script>
+</head>
+<body>
+<header class="page-header">
+  <div>
+    <h1>BTC-Bot Übersicht</h1>
+    <p class="muted">Konto {{ account_id }} · Zeiten in {{ tz_display }} · Stand <span id="generated-at">{{ now | local_ts("%d.%m.%Y %H:%M:%S") }}</span></p>
+  </div>
+  <div class="header-badges">
+    {% if equity.dry_run is true or (bot.reachable and bot.config.dry_run) %}<span class="badge badge-neutral">Dry-Run</span>{% endif %}
+    {% if guard.killswitch.active %}<span class="badge badge-critical">Kill-Switch aktiv</span>{% endif %}
+    {% if settings_error %}<span class="badge badge-critical" title="{{ settings_error }}">Konfiguration ungültig, Standardwerte aktiv</span>{% endif %}
+    {% if not ledger_available %}<span class="badge badge-warn">Ledger noch leer</span>{% endif %}
+  </div>
+</header>
+
+<main>
+  <section class="tiles" id="tiles" aria-label="Kennzahlen"
+           hx-get="/partials/tiles" hx-trigger="every 30s" hx-swap="innerHTML" hx-sync="this:drop">
+    {% include "_tiles.html" %}
+  </section>
+
+  <section class="charts" aria-label="Charts">
+    <article class="card">
+      <div class="card-head">
+        <h2>Equity: Bot, Buy-and-Hold, DCA</h2>
+        <div class="range" role="group" aria-label="Zeitraum">
+          <button type="button" data-days="30">30 T</button>
+          <button type="button" data-days="90">90 T</button>
+          <button type="button" data-days="365" class="active">1 J</button>
+          <button type="button" data-days="3660">alles</button>
+        </div>
+      </div>
+      <div class="chart-box"><canvas id="equity-chart" role="img" aria-label="Equity-Verlauf Bot, Buy-and-Hold und DCA in Euro"></canvas></div>
+      <p class="chart-note muted" id="equity-note">Lade Daten …</p>
+    </article>
+    <article class="card">
+      <div class="card-head"><h2>Drawdown vom Hoch</h2></div>
+      <div class="chart-box"><canvas id="drawdown-chart" role="img" aria-label="Drawdown Bot und Buy-and-Hold in Prozent"></canvas></div>
+      <details class="table-view">
+        <summary>Als Tabelle</summary>
+        <div class="table-wrap">
+          <table id="equity-table">
+            <thead><tr><th>Datum</th><th class="num">Bot</th><th class="num">B&amp;H</th><th class="num">DCA</th><th class="num">DD Bot</th><th class="num">DD B&amp;H</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+    </article>
+  </section>
+
+  <section class="card" aria-label="Fills">
+    <div class="card-head"><h2>Letzte Fills</h2></div>
+    <div id="fills" hx-get="/partials/fills" hx-trigger="every 30s" hx-swap="innerHTML" hx-sync="this:drop">
+      {% include "_fills.html" %}
+    </div>
+  </section>
+
+  <section class="card" aria-label="Ereignisse">
+    <div class="card-head"><h2>Guard-Ereignisse</h2></div>
+    <div id="events" hx-get="/partials/events" hx-trigger="every 30s" hx-swap="innerHTML" hx-sync="this:drop">
+      {% include "_events.html" %}
+    </div>
+  </section>
+</main>
+
+<footer class="muted">
+  Nur Lesezugriff. Steuerzahlen sind eine Hilfe, keine Beratung. Der Jahresreport aus <code>btctrader-ledger report</code> ist maßgeblich.
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

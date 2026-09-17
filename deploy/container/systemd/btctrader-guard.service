@@ -1,0 +1,34 @@
+# One guard check: daily loss limit, drawdown kill switch, balance reconciliation, advisor
+# freshness, Freqtrade reachability. Started by btctrader-guard.timer every minute.
+# Needs FT_API_USER/FT_API_PASS from btctrader.env. The optional dead man's switch (GUARD_COD_ENABLED)
+# needs GUARD_TRADE_API_KEY/SECRET from /etc/freqtrade/secrets-guard.env, which only this unit loads.
+[Unit]
+Description=btctrader guard check (risk limits and kill switch)
+Documentation=file:///srv/trading/repo/docs/BETRIEB.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=freqtrade
+Group=freqtrade
+UMask=0027
+WorkingDirectory=/srv/trading
+EnvironmentFile=/etc/freqtrade/btctrader.env
+# Trade key for cancelOrdersAfter (Phase 4, optional). "-" = ignore a missing file.
+EnvironmentFile=-/etc/freqtrade/secrets-guard.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/srv/trading/venv/bin/btctrader-guard check
+# One run may legitimately take minutes when Freqtrade is slow (token login, four API calls,
+# forceexit, alerts, each with a 10 s timeout). A SIGTERM between forceexit and writing
+# killswitch.lock would be worse than a late run: the timer skips a trigger while the service
+# still runs, and check/reset serialise on an flock in GUARD_DIR.
+TimeoutStartSec=4min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/trading/guard
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true

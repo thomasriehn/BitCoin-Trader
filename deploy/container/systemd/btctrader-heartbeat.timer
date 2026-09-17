@@ -1,0 +1,12 @@
+[Unit]
+Description=Run btctrader heartbeat every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=5s
+RandomizedDelaySec=5
+Persistent=true
+Unit=btctrader-heartbeat.service
+
+[Install]
+WantedBy=timers.target

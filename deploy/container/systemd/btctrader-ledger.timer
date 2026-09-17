@@ -1,0 +1,12 @@
+[Unit]
+Description=Run btctrader-ledger daily at 00:20 UTC
+
+[Timer]
+# The daily candle closes at 00:00 UTC; 20 minutes later Freqtrade has processed it.
+OnCalendar=*-*-* 00:20:00 UTC
+RandomizedDelaySec=120
+Persistent=true
+Unit=btctrader-ledger.service
+
+[Install]
+WantedBy=timers.target

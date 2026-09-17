@@ -1,0 +1,27 @@
+# Heartbeat: GET /api/v1/health on Freqtrade; fresh last_process and no killswitch.lock -> ping
+# HEALTHCHECKS_URL, otherwise HEALTHCHECKS_URL/fail. Started by btctrader-heartbeat.timer every minute.
+[Unit]
+Description=btctrader heartbeat (Healthchecks ping)
+Documentation=file:///srv/trading/repo/docs/BETRIEB.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=freqtrade
+Group=freqtrade
+UMask=0027
+WorkingDirectory=/srv/trading
+EnvironmentFile=/etc/freqtrade/btctrader.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/srv/trading/venv/bin/btctrader-guard heartbeat
+# Health call plus ping, 10 s timeout each; the timer skips a trigger while the service runs.
+TimeoutStartSec=2min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Writes nothing (reads killswitch.lock only): the whole file system stays read-only.
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true

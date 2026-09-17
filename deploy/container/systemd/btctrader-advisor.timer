@@ -1,0 +1,11 @@
+[Unit]
+Description=Run btctrader-advisor hourly at minute 7
+
+[Timer]
+OnCalendar=*-*-* *:07:00
+RandomizedDelaySec=30
+Persistent=true
+Unit=btctrader-advisor.service
+
+[Install]
+WantedBy=timers.target

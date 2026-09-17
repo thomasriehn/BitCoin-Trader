@@ -1,0 +1,52 @@
+# Freqtrade LIVE bot (Phase 4 and later). Real orders with the Trade key from /etc/freqtrade/secrets.env.
+# secrets.env also overrides dry_run=false, api_server port 8081 and the bot name (FREQTRADE__ env vars
+# win over the config files). Own database tradesv3.sqlite, own log file.
+# install.sh never enables or starts this unit. Do it by hand after docs/SETUP.md step 11 and
+# docs/BETRIEB.md "Phase 4". Never run two bots with trade rights against the same exchange account.
+# Hardening notes: see freqtrade-dryrun.service.
+[Unit]
+Description=Freqtrade BTC/EUR bot (live)
+Documentation=file:///srv/trading/repo/docs/BETRIEB.md
+After=network-online.target
+Wants=network-online.target
+# No start rate limit: with the old 5 starts per minute (RestartSec=10) a fast failure loop after a power
+# outage (DNS or api.bitvavo.com not reachable yet, Freqtrade exits with code 2) would leave
+# the unit in "failed" and Restart=always would stop trying. Restart=always plus RestartSec
+# keeps retrying; a real config error loops until you run: systemctl stop <unit>.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=freqtrade
+Group=freqtrade
+UMask=0027
+WorkingDirectory=/srv/trading
+EnvironmentFile=/etc/freqtrade/btctrader.env
+EnvironmentFile=/etc/freqtrade/secrets.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/freqtrade/venv/bin/freqtrade trade \
+  --userdir /srv/trading/user_data \
+  --config /srv/trading/user_data/config.json \
+  --config /srv/trading/user_data/config-private.json \
+  --strategy BtcTrend \
+  --db-url sqlite:////srv/trading/user_data/tradesv3.sqlite \
+  --logfile /srv/trading/user_data/logs/freqtrade.log \
+  --sd-notify
+Restart=always
+RestartSec=10
+TimeoutStartSec=2min
+TimeoutStopSec=90
+# at least 2 x internals.process_throttle_secs (5 s in config.json)
+WatchdogSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/trading
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

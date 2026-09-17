@@ -1,0 +1,67 @@
+# vLLM OpenAI-compatible server for the btctrader advisor (GPU host, not the trading container).
+# Verified against vllm/vllm-openai:v0.29.0 (2026-09-09). Configure via .env (see .env.example).
+#
+# Start:      docker compose up -d
+# Logs:       docker compose logs -f vllm
+# Health:     curl -fsS http://127.0.0.1:${VLLM_PORT:-8000}/health
+# Models:     curl -fsS -H "Authorization: Bearer $VLLM_API_KEY" http://127.0.0.1:8000/v1/models
+
+services:
+  vllm:
+    image: vllm/vllm-openai:${VLLM_IMAGE_TAG:-v0.29.0}
+    container_name: vllm-advisor
+    restart: unless-stopped
+    # Bind to localhost by default; reach it through Tailscale or an SSH tunnel, never expose it publicly.
+    ports:
+      - "${VLLM_BIND:-127.0.0.1}:${VLLM_PORT:-8000}:8000"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      # vLLM reads the key from this variable itself (vllm/envs.py). Not passed as --api-key on
+      # purpose: the command line is visible in `ps aux` on the host and in `docker inspect`.
+      VLLM_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY in .env}
+    volumes:
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+    # PyTorch shares tensors between processes via /dev/shm.
+    ipc: host
+    command:
+      - --model
+      - ${VLLM_MODEL:?set VLLM_MODEL in .env}
+      - --served-model-name
+      - ${VLLM_SERVED_NAME:-advisor}
+      - --max-model-len
+      - "${VLLM_MAX_MODEL_LEN:-8192}"
+      - --seed
+      - "${VLLM_SEED:-42}"
+      - --gpu-memory-utilization
+      - "${VLLM_GPU_MEM:-0.90}"
+      - --max-num-seqs
+      - "${VLLM_MAX_NUM_SEQS:-4}"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --structured-outputs-config.backend
+      - ${VLLM_SO_BACKEND:-auto}
+      # Hybrid thinking models (Qwen3, Qwen3.5, Gemma 4): the advisor sends enable_thinking=false,
+      # the parser only matters if you enable thinking yourself.
+      - --reasoning-parser
+      - ${VLLM_REASONING_PARSER:-qwen3}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${VLLM_GPU_COUNT:-1}
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 600s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

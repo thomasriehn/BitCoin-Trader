@@ -1,0 +1,113 @@
+{# Stat tiles. Values wear text tokens; a status glyph plus label carries state, never color alone. #}
+{% if oob %}<span id="generated-at" hx-swap-oob="true">{{ now | local_ts("%d.%m.%Y %H:%M:%S") }}</span>{% endif %}
+<article class="tile" id="equity">
+  <h3>Equity</h3>
+  <p class="value">{{ equity.equity_eur | eur }}</p>
+  <p class="sub">B&amp;H {{ equity.bh_equity_eur | eur }} · DCA {{ equity.dca_equity_eur | eur }}</p>
+  <p class="sub muted">{% if equity.to %}Stand {{ equity.to | de_date }}{% if equity.btc_price_eur %} · BTC {{ equity.btc_price_eur | eur(0) }}{% endif %}{% else %}Noch kein Tages-Snapshot{% endif %}</p>
+</article>
+
+<article class="tile" id="outperformance">
+  <h3>Überrendite</h3>
+  <p class="value">{{ equity.vs_bh_pct | pct }}</p>
+  <p class="sub">vs. B&amp;H {{ equity.vs_bh_eur | eur }}</p>
+  <p class="sub">vs. DCA {{ equity.vs_dca_eur | eur }} ({{ equity.vs_dca_pct | pct }})</p>
+</article>
+
+<article class="tile" id="drawdown">
+  <h3>Max. Drawdown vom Hoch ({{ equity_days }} Tage)</h3>
+  <p class="value">{{ equity.max_drawdown_bot_pct | pct(2, false) }}</p>
+  <p class="sub">Bot · B&amp;H {{ equity.max_drawdown_bh_pct | pct(2, false) }} · DCA {{ equity.max_drawdown_dca_pct | pct(2, false) }}</p>
+  {% if guard.state and guard.state.peak_equity %}<p class="sub muted">Guard-Hoch {{ guard.state.peak_equity | eur }}</p>{% endif %}
+</article>
+
+<article class="tile" id="fees">
+  <h3>Gebühren {{ fees.year }}</h3>
+  <p class="value">{{ fees.ytd_eur | eur }}</p>
+  <p class="sub">gesamt {{ fees.cum_eur | eur }} · 30 Tage {{ fees.last_30d_eur | eur }}</p>
+  <p class="sub muted">
+    {% if fees.maker_share.by_count_pct is not none %}Maker-Anteil {{ fees.maker_share.by_count_pct | pct(0, false) }} ({{ fees.maker_share.maker_fills }} von {{ fees.maker_share.maker_fills + fees.maker_share.taker_fills }}){% else %}Maker-Anteil unbekannt (Dry-Run){% endif %}
+    · {{ fees.fills_total }} Fills
+  </p>
+</article>
+
+<article class="tile" id="tax">
+  <h3>§ 23 Gewinn {{ tax.year }}</h3>
+  <p class="value">{{ tax.gain_section_23_eur | eur }}</p>
+  {% if tax.freigrenze_exceeded %}
+  <p class="sub status status-critical"><span class="glyph" aria-hidden="true">!</span> Freigrenze überschritten: der ganze Gewinn ist steuerpflichtig</p>
+  {% else %}
+  <p class="sub status status-good"><span class="glyph" aria-hidden="true">✓</span> Abstand zur Freigrenze {{ tax.freigrenze_eur | eur(0) }}: {{ tax.distance_to_freigrenze_eur | eur }}</p>
+  {% endif %}
+  <p class="sub muted">Werbungskosten {{ tax.werbungskosten_eur | eur }} · Gebühren {{ tax.fees_ytd_eur | eur }} · {{ tax.counts.fills_year }} Fills</p>
+  <p class="sub muted">
+    {{ tax.counts.open_lots }} offene Lots
+    {% if next_free_lot %}· nächstes steuerfrei ab {{ next_free_lot.frei_ab | de_date }}{% endif %}
+  </p>
+  {% if tax.open_lots %}
+  <details class="lots">
+    <summary>Offene Lots</summary>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Lot</th><th>gekauft</th><th class="num">Rest</th><th>steuerfrei ab</th></tr></thead>
+        <tbody>
+        {% for lot in tax.open_lots %}
+          <tr>
+            <td>{{ lot.lot_id }}</td>
+            <td>{{ lot.acquired_at[:10] | de_date }}</td>{# UTC calendar day, same rule as frei_ab #}
+            <td class="num">{{ lot.remaining_qty_btc | btc }}</td>
+            <td>{% if lot.tax_free_now %}<span class="status status-good"><span class="glyph" aria-hidden="true">✓</span> frei</span>{% else %}{{ lot.frei_ab | de_date }} ({{ lot.days_until_free }} T){% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+  {% endif %}
+</article>
+
+<article class="tile" id="bot">
+  <h3>Bot</h3>
+  {% if bot.reachable %}
+    {% set st = bot.config.state or "unbekannt" %}
+    <p class="value status {% if st == 'running' %}status-good{% elif st == 'paused' %}status-warn{% else %}status-critical{% endif %}">
+      <span class="glyph" aria-hidden="true">{% if st == 'running' %}✓{% elif st == 'paused' %}!{% else %}×{% endif %}</span>
+      {% if st == 'running' %}läuft{% elif st == 'paused' %}pausiert (kein Entry){% elif st == 'stopped' %}gestoppt{% else %}{{ st }}{% endif %}
+    </p>
+    <p class="sub">{{ bot.config.strategy or "–" }}{% if bot.config.dry_run %} · Dry-Run{% endif %} · {{ bot.open_trades | length }} offen</p>
+    <p class="sub muted">
+      Gewinn geschlossen {{ bot.profit.profit_closed_coin | eur }}
+      {% if bot.profit.closed_trade_count is defined and bot.profit.closed_trade_count is not none %}· {{ bot.profit.closed_trade_count }} Trades{% endif %}
+      {% if bot.health.last_process %}· zuletzt {{ bot.health.last_process | local_ts("%H:%M:%S") }}{% endif %}
+    </p>
+  {% else %}
+    <p class="value status status-critical"><span class="glyph" aria-hidden="true">×</span> nicht erreichbar</p>
+    <p class="sub muted">{{ bot.error }}</p>
+  {% endif %}
+  {% if guard.killswitch.active %}
+    <p class="sub status status-critical"><span class="glyph" aria-hidden="true">!</span> Kill-Switch seit {{ guard.killswitch.content.ts | local_ts if guard.killswitch.content and guard.killswitch.content.ts else "?" }}</p>
+  {% elif guard.state and guard.state.last_check %}
+    <p class="sub muted">Guard-Check {{ guard.state.last_check | local_ts("%H:%M:%S") }}{% if guard.state.day_start_equity %} · Tagesstart {{ guard.state.day_start_equity | eur }}{% endif %}</p>
+  {% endif %}
+</article>
+
+<article class="tile" id="advisor">
+  <h3>Advisor</h3>
+  {% if advisor.decision %}
+    {% set regime = advisor.decision.regime %}
+    <p class="value status {% if regime == 'risk_on' %}status-good{% elif regime == 'risk_off' %}status-warn{% else %}status-neutral{% endif %}">
+      <span class="glyph" aria-hidden="true">{% if regime == 'risk_on' %}▲{% elif regime == 'risk_off' %}▼{% else %}●{% endif %}</span>
+      {% if regime == 'risk_on' %}Risk-on{% elif regime == 'risk_off' %}Risk-off{% else %}Neutral{% endif %}
+    </p>
+    <p class="sub">Konfidenz {{ advisor.confidence_pct | pct(0, false) }} · Horizont {{ advisor.decision.horizon_days | default("–", true) }} T · Modus {{ advisor.decision.mode | default("–", true) }}</p>
+    <p class="sub muted">
+      {{ advisor.decision.created_at | local_ts }}
+      {% if advisor.valid %}· gültig{% else %}· <span class="status status-warn"><span class="glyph" aria-hidden="true">!</span> abgelaufen</span>{% endif %}
+    </p>
+  {% else %}
+    <p class="value muted">keine Entscheidung</p>
+  {% endif %}
+  {% if advisor.last_log and advisor.last_log.error %}
+    <p class="sub status status-warn"><span class="glyph" aria-hidden="true">!</span> letzter Lauf fehlgeschlagen: {{ advisor.last_log.error | truncate(120) }}</p>
+  {% endif %}
+</article>

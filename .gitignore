@@ -1,0 +1,32 @@
+# Secrets: never commit exchange or API credentials
+secrets*.env
+*.env
+config-private.json
+*.key
+*.pem
+
+# Freqtrade runtime data
+user_data/data/
+user_data/logs/
+user_data/backtest_results/
+user_data/hyperopt_results/
+*.sqlite
+*.sqlite-journal
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Build metadata
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,27 @@
+{% if fills %}
+<div class="table-wrap">
+  <table class="fills">
+    <thead>
+      <tr>
+        <th>Zeit</th><th>Seite</th><th class="num">Menge</th><th class="num">Kurs</th><th class="num">Brutto</th><th class="num">Gebühr</th><th>Typ</th><th>Grund</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for f in fills %}
+      <tr>
+        <td>{{ f.ts_utc | local_ts }}</td>
+        <td><span class="side side-{{ f.side }}">{{ "Kauf" if f.side == "buy" else "Verkauf" }}</span></td>
+        <td class="num">{{ f.amount_btc | btc }}</td>
+        <td class="num">{{ f.price_eur | eur }}</td>
+        <td class="num">{{ f.gross_eur | eur }}</td>
+        <td class="num">{{ f.fee_eur | eur }}</td>
+        <td>{{ f.maker_taker or ("Dry-Run" if f.dry_run else "–") }}</td>
+        <td>{{ f.signal_reason or "–" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="muted empty">{% if ledger_available %}Noch keine Fills.{% else %}Ledger-Datenbank noch nicht vorhanden. Der erste <code>btctrader-ledger sync</code> legt sie an.{% endif %}</p>
+{% endif %}
